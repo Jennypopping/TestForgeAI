@@ -63,6 +63,11 @@ MAX_OUTPUT_BUDGET_REDUCTIONS = 3
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
+ANALYSIS_LIST_FIELDS = (
+    'business_rules',
+    'potential_risks',
+    'ambiguous_requirements',
+)
 
 
 @dataclass
@@ -229,19 +234,29 @@ class ProductOverviewSection(BaseModel):
 
 class BusinessRulesSection(BaseModel):
     business_rules: list[str] = Field(
-        description='产品业务规则'
+        description=(
+            '原子、可验证的业务规则，格式为 '
+            '[模块][规则类型] 触发条件/操作 → 预期结果'
+        )
     )
 
 
 class PotentialRisksSection(BaseModel):
     potential_risks: list[str] = Field(
-        description='潜在风险及异常场景'
+        description=(
+            '潜在风险，格式为 '
+            '[模块][风险类型] 触发场景 → 可能影响'
+        )
     )
 
 
 class AmbiguousRequirementsSection(BaseModel):
     ambiguous_requirements: list[str] = Field(
-        description='需求歧义、待确认问题和信息缺口'
+        description=(
+            '按优先级排序的待确认问题，格式为 '
+            '[P0|P1|P2][模块][歧义|冲突|缺失] '
+            '待确认点：...；需确认：...'
+        )
     )
 
 
@@ -253,13 +268,13 @@ class ProductAnalysis(BaseModel):
         description='产品核心功能模块'
     )
     business_rules: list[str] = Field(
-        description='产品业务规则'
+        description='原子、可验证的产品业务规则'
     )
     potential_risks: list[str] = Field(
-        description='潜在风险及异常场景'
+        description='带触发场景和影响说明的潜在风险'
     )
     ambiguous_requirements: list[str] = Field(
-        description='描述不明确、需要产品经理确认的需求'
+        description='按优先级排序的歧义、冲突、缺失与待确认问题'
     )
 
 
@@ -320,6 +335,42 @@ STAGE_SPECS = (
         ),
     ),
 )
+
+
+_STAGE_OUTPUT_CONTRACTS = {
+    'generation_2': (
+        '业务规则输出契约：\n'
+        '- 每条只描述一个原子、可验证的业务规则；不同条件、角色或状态不得混写。\n'
+        '- 统一格式：[模块][规则类型] 触发条件/操作 → 预期结果。\n'
+        '- 规则类型仅使用：状态流转、权限、条件约束、校验、数据约束、通知。\n'
+        '- 只输出文档明确表达或可直接推导的规则；文档未定义的细节不得补全。\n'
+        '- 同一规则只出现一次；同一状态机的通过/拒绝等分支应分别给出结果，'
+        '但不要重复相同前置条件。\n'
+        '- 不输出风险、待确认问题、实现建议或测试步骤。'
+    ),
+    'generation_3': (
+        '潜在风险输出契约：\n'
+        '- 每条只描述一个独立风险，必须由文档中的明确行为、约束缺失或流程冲突触发。\n'
+        '- 统一格式：[模块][风险类型] 触发场景 → 可能影响。\n'
+        '- 风险类型仅使用：边界条件、异常流程、并发、权限安全、'
+        '数据一致性、性能可用性、集成兼容。\n'
+        '- 影响必须具体到错误状态、数据损坏、越权或泄露、流程中断或统计失真。\n'
+        '- 合并同一根因的重复项，禁止只写“存在风险”或泛化的安全口号。\n'
+        '- 不输出待确认问题、实现建议或测试用例。'
+    ),
+    'generation_4': (
+        '需求歧义输出契约：\n'
+        '- 每条只描述一个可确认的问题；同一根因必须合并，禁止同义改写重复。\n'
+        '- 统一格式：[P0|P1|P2][模块][歧义|冲突|缺失] '
+        '待确认点：...；需确认：...。\n'
+        '- 优先级：P0 表示阻塞主流程或无法开发/测试；P1 表示影响关键规则、'
+        '数据或权限；P2 表示体验或非关键边界。\n'
+        '- 只列 PRD 的含糊、矛盾、缺失约束或不可验证描述，不输出风险分析、'
+        '实现建议或测试用例。\n'
+        '- 按 P0、P1、P2 顺序输出；每个模块优先保留影响最大的问题，'
+        '避免穷举所有可能分支。'
+    ),
+}
 
 
 class AIAnalyzer:
@@ -2037,6 +2088,7 @@ class AIAnalyzer:
 
         merged: dict[str, Any] = {}
         field_sources: dict[str, str] = {}
+        seen_analysis_items: set[str] = set()
         for spec in STAGE_SPECS:
             payload = stage_payloads[spec.key]
             expected_fields = set(spec.schema.model_fields)
@@ -2063,7 +2115,27 @@ class AIAnalyzer:
                         stage='final',
                         details={'duplicate_field': field_name},
                     )
-                merged[field_name] = payload[field_name]
+                if field_name in ANALYSIS_LIST_FIELDS:
+                    items = _dedupe_texts(payload[field_name])
+                    unique_items = []
+                    duplicate_count = 0
+                    for item in items:
+                        fingerprint = _text_fingerprint(item)
+                        if fingerprint in seen_analysis_items:
+                            duplicate_count += 1
+                            continue
+                        seen_analysis_items.add(fingerprint)
+                        unique_items.append(item)
+                    if duplicate_count:
+                        logger.info(
+                            'Removed cross-field duplicate analysis items: '
+                            'field=%s count=%d',
+                            field_name,
+                            duplicate_count,
+                        )
+                    merged[field_name] = unique_items
+                else:
+                    merged[field_name] = payload[field_name]
                 field_sources[field_name] = spec.key
 
         expected_fields = set(ProductAnalysis.model_fields)
@@ -2329,20 +2401,40 @@ def _batch_modules_for_max_batches(
     return _batch_modules(modules, max(1, batch_size))
 
 
+_LIST_ITEM_MARKER_RE = re.compile(
+    r'^\s*(?:[-*•·]|(?:\d+|[一二三四五六七八九十]+)[.)、]|'
+    r'[（(](?:\d+|[一二三四五六七八九十]+)[)）])\s*'
+)
+
+
+def _normalize_analysis_item(value: str) -> str:
+    text = value.strip()
+    while text:
+        stripped = _LIST_ITEM_MARKER_RE.sub('', text, count=1).strip()
+        if stripped == text:
+            break
+        text = stripped
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _text_fingerprint(text: str) -> str:
+    return re.sub(
+        r'[\s，。；、,.!?！？:：\-—（）()\[\]【】]+',
+        '',
+        text,
+    ).casefold()
+
+
 def _dedupe_texts(values: Any) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
         if not isinstance(value, str):
             continue
-        text = value.strip()
+        text = _normalize_analysis_item(value)
         if not text:
             continue
-        normalized = re.sub(
-            r'[\s，。；、,.!?！？:：\-—（）()\[\]【】]+',
-            '',
-            text,
-        ).casefold()
+        normalized = _text_fingerprint(text)
         if normalized in seen:
             continue
         seen.add(normalized)
@@ -2415,18 +2507,26 @@ def _short_text(value: str, limit: int) -> str:
 
 def _build_system_prompt(spec: _StageSpec) -> str:
     required_fields = '、'.join(spec.schema.model_fields.keys())
+    field_contract = _STAGE_OUTPUT_CONTRACTS.get(spec.key)
+    contract_block = (
+        f'\n    {field_contract}\n'
+        if field_contract
+        else ''
+    )
     return f'''
     你是一名拥有10年以上经验的软件测试开发工程师。
 
     本次只执行一个独立分析阶段：{spec.label}。
     {spec.focus}
+    {contract_block}
 
     硬性要求：
     - 只能依据用户提供的原始文档进行分析。
     - 不允许编造产品功能、业务规则或风险。
     - 只返回一个合法 JSON 对象，不要返回 Markdown 代码块。
     - JSON 必须且只能包含这些字段：{required_fields}。
-    - 列表中的每一条应是独立、完整、可验证的结论。
+    - 列表中的每一条应是独立、完整、可验证的结论，并标注所属模块。
+    - 合并同一根因、同一规则或同一确认点，禁止同义改写和近义重复。
     - 输出保持精炼，避免与当前阶段无关的重复内容。
     '''
 

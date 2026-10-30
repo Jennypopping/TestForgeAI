@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Optional
 
 import streamlit as st
@@ -74,17 +75,32 @@ def render_analysis_report(analysis: ProductAnalysis) -> None:
     for item in analysis.core_features:
         st.write(f'- {item}')
 
-    st.markdown('### 业务规则')
+    st.markdown(f'### 业务规则（{len(analysis.business_rules)} 条）')
     for item in analysis.business_rules:
         st.write(f'- {item}')
 
-    st.markdown('### 潜在风险')
+    st.markdown(f'### 潜在风险（{len(analysis.potential_risks)} 条）')
     for item in analysis.potential_risks:
         st.warning(item)
 
-    st.markdown('### 需求歧义')
-    for item in analysis.ambiguous_requirements:
+    st.markdown(
+        f'### 需求歧义与待确认问题'
+        f'（{len(analysis.ambiguous_requirements)} 条）'
+    )
+    for item in _sort_by_priority(analysis.ambiguous_requirements):
         st.info(item)
+
+
+def _sort_by_priority(items: list[str]) -> list[str]:
+    priority_re = re.compile(r'^\s*(?:\[)?(P[0-2])')
+
+    def priority_key(item: str) -> tuple[int, int]:
+        match = priority_re.match(item)
+        if match is None:
+            return (3, 0)
+        return (int(match.group(1)[1]), 0)
+
+    return sorted(items, key=priority_key)
 
 
 def render_debug_panel(

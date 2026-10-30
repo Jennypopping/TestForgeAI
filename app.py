@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import tempfile
@@ -39,6 +40,29 @@ st.divider()
 
 st.subheader('产品文档智能分析')
 
+
+ANALYSIS_RESULT_STATE_KEY = 'analysis_result'
+ANALYSIS_TRACE_STATE_KEY = 'analysis_trace'
+ANALYSIS_FILE_STATE_KEY = 'analysis_file_signature'
+
+
+def _uploaded_file_signature(uploaded_file):
+    if uploaded_file is None:
+        return None
+
+    content_digest = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+    return f'{uploaded_file.name}:{uploaded_file.size}:{content_digest}'
+
+
+def _clear_analysis_state():
+    for key in (
+        ANALYSIS_RESULT_STATE_KEY,
+        ANALYSIS_TRACE_STATE_KEY,
+        ANALYSIS_FILE_STATE_KEY,
+    ):
+        st.session_state.pop(key, None)
+
+
 uploaded_file = st.file_uploader(
     '上传产品需求文档',
     type=['pdf', 'docx', 'md', 'txt'],
@@ -47,6 +71,14 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
 
     st.info(f'当前文件：{uploaded_file.name}')
+
+    current_file_signature = _uploaded_file_signature(uploaded_file)
+    stored_file_signature = st.session_state.get(ANALYSIS_FILE_STATE_KEY)
+    if (
+        stored_file_signature is not None
+        and stored_file_signature != current_file_signature
+    ):
+        _clear_analysis_state()
 
     if st.button('开始 AI 分析', type='primary'):
 
@@ -116,16 +148,9 @@ if uploaded_file:
                 expanded=False,
             )
 
-            render_analysis_report(analysis)
-
-            st.download_button(
-                label='下载 AI 分析结果 JSON',
-                data=analysis.model_dump_json(indent=2),
-                file_name='product_analysis.json',
-                mime='application/json',
-            )
-
-            render_debug_panel(analyzer.last_trace)
+            st.session_state[ANALYSIS_RESULT_STATE_KEY] = analysis
+            st.session_state[ANALYSIS_TRACE_STATE_KEY] = analyzer.last_trace
+            st.session_state[ANALYSIS_FILE_STATE_KEY] = current_file_signature
 
         except AIAnalysisError as exc:
             progress.update(
@@ -162,3 +187,17 @@ if uploaded_file:
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    analysis = st.session_state.get(ANALYSIS_RESULT_STATE_KEY)
+    if analysis is not None:
+        st.download_button(
+            label='下载 AI 分析结果 JSON',
+            data=analysis.model_dump_json(indent=2),
+            file_name='product_analysis.json',
+            mime='application/json',
+            on_click='ignore',
+        )
+        render_analysis_report(analysis)
+        render_debug_panel(
+            st.session_state.get(ANALYSIS_TRACE_STATE_KEY)
+        )

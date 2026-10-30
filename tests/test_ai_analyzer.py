@@ -13,7 +13,9 @@ from services.ai_analyzer import (
     AIValidationError,
     AIAnalyzer,
     STAGE_SPECS,
+    _build_system_prompt,
     _build_subtasks,
+    _dedupe_texts,
 )
 
 
@@ -156,6 +158,68 @@ def _bad_request(message):
 
 
 class AIAnalyzerTests(unittest.TestCase):
+
+    def test_stage_prompts_define_quality_contracts(self):
+        specs = {spec.key: spec for spec in STAGE_SPECS}
+        expected_fragments = {
+            'generation_2': '[模块][规则类型]',
+            'generation_3': '[模块][风险类型]',
+            'generation_4': '[P0|P1|P2][模块][歧义|冲突|缺失]',
+        }
+
+        for stage_key, fragment in expected_fragments.items():
+            prompt = _build_system_prompt(specs[stage_key])
+            self.assertIn('输出契约', prompt)
+            self.assertIn(fragment, prompt)
+            self.assertIn('合并同一根因', prompt)
+
+    def test_merge_normalizes_and_deduplicates_analysis_items(self):
+        analyzer, _ = _build_analyzer([])
+        payloads = _stage_payloads()
+        payloads[1] = {
+            'business_rules': [
+                '  1. [审核][状态流转] 开启 → pending  ',
+                '- [审核][状态流转] 开启 → pending',
+                '[审核][状态流转] 关闭 → scheduled',
+            ],
+        }
+        payloads[2] = {
+            'potential_risks': [
+                '- [审核][状态流转] 开启 → pending',
+                '  2、 [审核][权限安全] 越权审核 → 数据泄露  ',
+            ],
+        }
+        stage_payloads = {
+            'generation_1': payloads[0],
+            'generation_2': payloads[1],
+            'generation_3': payloads[2],
+            'generation_4': {'ambiguous_requirements': []},
+        }
+        trace = AIAnalysisTrace(model='deepseek-flash')
+
+        analysis = analyzer._merge_stage_results(stage_payloads, trace)
+
+        self.assertEqual(
+            analysis.business_rules,
+            [
+                '[审核][状态流转] 开启 → pending',
+                '[审核][状态流转] 关闭 → scheduled',
+            ],
+        )
+        self.assertEqual(
+            analysis.potential_risks,
+            ['[审核][权限安全] 越权审核 → 数据泄露'],
+        )
+
+    def test_dedupe_texts_strips_list_markers_and_whitespace(self):
+        self.assertEqual(
+            _dedupe_texts([
+                '- [A]  第一条',
+                '1. [A] 第一条',
+                ' [B] 第二条 ',
+            ]),
+            ['[A] 第一条', '[B] 第二条'],
+        )
 
     def test_staged_generation_merges_all_fields(self):
         analyzer, completions = _build_analyzer(
