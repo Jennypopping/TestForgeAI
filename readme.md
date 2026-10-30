@@ -1,6 +1,79 @@
-## 使用方法
+## 快速开始
+
+### 环境要求
+
+- Python 3.9+（当前验证版本：3.9.13）
+- SQLite 由 Python 标准库自带，无需单独安装数据库服务
+- 可访问 DeepSeek API 的网络
+
+### 从 GitHub 克隆并启动（Windows PowerShell）
+
+```powershell
+git clone https://github.com/Jennypopping/TestForgeAI.git
+cd TestForgeAI
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+Copy-Item .env.example .env
+# 编辑 .env，填入自己的 DEEPSEEK_API_KEY
 streamlit run app.py
-访问http://localhost:8501
+```
+
+启动后访问 http://localhost:8501。
+
+### 从 GitHub 克隆并启动（Linux / macOS）
+
+```bash
+git clone https://github.com/Jennypopping/TestForgeAI.git
+cd TestForgeAI
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env
+# 编辑 .env，填入自己的 DEEPSEEK_API_KEY
+streamlit run app.py
+```
+
+`DEEPSEEK_API_KEY` 只保存在本地 `.env` 中；`.env` 已被 `.gitignore`
+排除，不会被提交到 GitHub。可从 `.env.example` 查看所有可配置项。
+
+### 首次启动与数据库说明
+
+- 从 GitHub 克隆项目后，**不需要下载任何数据库文件**。
+- 首次运行 `streamlit run app.py` 时，程序会自动创建 SQLite 数据库及其表结构。
+- 数据库默认路径为项目根目录下的 `data/testforge.db`；如果 `data` 目录不存在，也会自动创建。
+- 后续启动会自动读取已有数据库，不会清空、删除或覆盖历史报告。
+- 每次启动都会执行幂等的数据库结构初始化；未来新增字段时通过 schema 版本迁移处理，不会重建已有表。
+- 历史报告仅保存在当前电脑本地，不会自动上传到 GitHub。
+- 删除本地数据库会导致本地历史报告丢失。删除前请先停止应用并备份：
+
+```powershell
+Copy-Item data\testforge.db data\testforge.db.backup
+```
+
+```bash
+cp data/testforge.db data/testforge.db.backup
+```
+
+默认数据库路径与业务代码解耦，统一由 `config/settings.py` 计算，因此无论从哪个
+工作目录启动，都会使用同一个项目内数据库。需要自定义路径时，可在 `.env` 中设置
+`TESTFORGE_DB_PATH`；相对路径同样基于项目根目录解析：
+
+```dotenv
+TESTFORGE_DB_PATH=data/testforge.db
+```
+
+`.gitignore` 会忽略 `data/*`，但保留可提交的 `data/.gitkeep`，因此不会把
+`data/testforge.db` 或本地历史报告提交到 GitHub。
+
+### 运行测试
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
 
 ## 开发问题与解决记录
 
@@ -159,8 +232,9 @@ Streamlit 导航包含以下页面：
   的顺序展示，并提供原文依据、AI 分析说明、JSON 下载和原始 PRD Markdown。
 
 数据库操作封装在 `services/report_repository.py`，页面不直接执行 SQL。
-运行持久化测试：
+数据库创建与 schema 迁移封装在 `services/database.py`，路径配置集中在
+`config/settings.py`。运行全部测试：
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_report_repository -v
+.\.venv\Scripts\python.exe -m pytest -q
 ```

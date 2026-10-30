@@ -5,13 +5,14 @@ __pycache__/
 .pytest_cache/
 
 # Virtual environments
-/.venv/
+.venv/
 /Lib/
 /Scripts/
 /pyvenv.cfg
 
 # Local report database
-/data/
+data/*
+!data/.gitkeep
 
 # Local configuration and secrets
 .env

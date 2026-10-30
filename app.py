@@ -6,6 +6,8 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
+from services.database import DatabaseInitializationError, initialize_database
+
 
 load_dotenv()
 
@@ -22,6 +24,12 @@ st.set_page_config(
     page_title='TestForge AI',
     layout='wide',
 )
+
+try:
+    initialize_database()
+except DatabaseInitializationError as exc:
+    st.error(f'数据库初始化失败：{exc}')
+    st.stop()
 
 pages = [
     st.Page(
