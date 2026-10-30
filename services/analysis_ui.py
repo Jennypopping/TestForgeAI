@@ -16,6 +16,11 @@ from services.ai_analyzer import (
     RequirementItem,
 )
 
+
+def _item_field(item: Any, field_name: str, default: Any = '') -> Any:
+    return getattr(item, field_name, default)
+
+
 STAGE_TITLES = {
     'document_parse': '文档解析',
     'prompt': 'Prompt 构建',
@@ -162,24 +167,34 @@ def _render_analysis_item(
     show_risk_type: bool,
     show_priority: bool,
 ) -> None:
-    st.markdown(f'**{index}. {item.content}**')
+    content = _item_field(item, 'content')
+    st.markdown(f'**{index}. {content}**')
 
-    labels = [f'证据类型：`{item.evidence_type}`']
+    evidence_type = _item_field(item, 'evidence_type')
+    labels = [f'证据类型：`{evidence_type}`']
     if show_risk_type:
-        risk_type = getattr(item, 'risk_type', '')
+        risk_type = _item_field(item, 'risk_type')
         if risk_type:
             labels.append(f'风险类型：`{risk_type}`')
     if show_priority and isinstance(item, RequirementItem):
-        if item.requirement_id:
-            labels.append(f'问题 ID：`{item.requirement_id}`')
-        if item.question_id:
-            labels.append(f'原始问题：`{item.question_id}`')
-        labels.append(f'优先级：`{item.priority}`')
-    if item.related_question_id:
-        labels.append(f'关联问题：`{item.related_question_id}`')
-    if item.related_requirement_id:
-        labels.append(f'关联需求问题：`{item.related_requirement_id}`')
-    if isinstance(item, PotentialRiskItem) and item.needs_product_confirmation:
+        requirement_id = _item_field(item, 'requirement_id')
+        if requirement_id:
+            labels.append(f'问题 ID：`{requirement_id}`')
+        question_id = _item_field(item, 'question_id')
+        if question_id:
+            labels.append(f'原始问题：`{question_id}`')
+        priority = _item_field(item, 'priority')
+        labels.append(f'优先级：`{priority}`')
+    related_question_id = _item_field(item, 'related_question_id')
+    if related_question_id:
+        labels.append(f'关联问题：`{related_question_id}`')
+    related_requirement_id = _item_field(item, 'related_requirement_id')
+    if related_requirement_id:
+        labels.append(f'关联需求问题：`{related_requirement_id}`')
+    if (
+        isinstance(item, PotentialRiskItem)
+        and _item_field(item, 'needs_product_confirmation', False)
+    ):
         labels.append('预期行为待产品确认')
     labels.append(
         f'来源章节：{item.source_section or "未定位"}'
@@ -189,7 +204,10 @@ def _render_analysis_item(
     with st.expander('查看原文依据', expanded=False):
         source_parts = [
             part.strip()
-            for part in re.split(r'\s*(?:｜|\|\||\n+)\s*', item.source_text)
+            for part in re.split(
+                r'\s*(?:｜|\|\||\n+)\s*',
+                _item_field(item, 'source_text'),
+            )
             if part.strip()
         ]
         if source_parts:
@@ -202,14 +220,15 @@ def _render_analysis_item(
             )
 
     with st.expander('查看 AI 分析说明', expanded=False):
-        st.write(item.analysis)
+        st.write(_item_field(item, 'analysis'))
 
     if isinstance(item, PotentialRiskItem):
         st.markdown('**测试建议**')
-        st.write(item.test_suggestion)
+        st.write(_item_field(item, 'test_suggestion') or '暂无测试建议。')
         st.markdown('**预期行为**')
-        if item.expected_behavior:
-            st.write(item.expected_behavior)
+        expected_behavior = _item_field(item, 'expected_behavior')
+        if expected_behavior:
+            st.write(expected_behavior)
         else:
             st.caption('PRD 未定义该风险的明确预期行为，需要产品确认。')
     st.markdown('')

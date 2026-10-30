@@ -10,6 +10,9 @@ __pycache__/
 /Scripts/
 /pyvenv.cfg
 
+# Local report database
+/data/
+
 # Local configuration and secrets
 .env
 .env.*

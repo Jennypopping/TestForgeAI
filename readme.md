@@ -135,3 +135,32 @@ DeepSeek 默认思考模式下，reasoning_tokens 与 JSON 输出共享
 ### 会议室 PRD 复分析结果
 
 结果保存在 `src/meeting-room-product_analysis_round2.json`：业务规则 27 条、潜在风险 6 条、冲突 0 条、歧义 4 条、缺失 5 条、待确认问题 4 条。管理员新增/编辑/停用会议室已合并为一条权限规则，Q1-Q4 保留在待确认问题中。
+
+## 6. AI 产品分析报告管理
+
+分析成功后，报告会自动保存到本地 SQLite 数据库，默认路径为
+`data/testforge.db`。如需调整路径，可设置环境变量：
+
+```powershell
+$env:TESTFORGE_DB_PATH = 'D:\data\testforge.db'
+```
+
+报告记录包含唯一 ID、报告名称、原始文件名、生成时间、分析状态、
+完整分析 JSON 和解析后的 PRD Markdown。只有通过
+`ProductAnalysis` Pydantic 校验的分析结果才会写入数据库；报告 ID
+由 UUID 生成，不会覆盖已有报告。
+
+Streamlit 导航包含以下页面：
+
+- **新建分析**：上传 PRD，解析并调用 DeepSeek 生成报告，成功后自动保存。
+- **报告管理**：按名称搜索、按生成时间排序、查看详情和二次确认删除。
+- **报告详情**：直接读取数据库中的分析结果，不重新调用 AI；按产品概述、
+  核心功能、业务规则、潜在风险、需求冲突、需求歧义、需求缺失、待确认问题
+  的顺序展示，并提供原文依据、AI 分析说明、JSON 下载和原始 PRD Markdown。
+
+数据库操作封装在 `services/report_repository.py`，页面不直接执行 SQL。
+运行持久化测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_report_repository -v
+```
