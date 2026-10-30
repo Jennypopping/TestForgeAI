@@ -1,0 +1,5 @@
+docling==2.69.1
+openai==2.48.0
+pydantic==2.13.5
+python-dotenv==1.2.1
+streamlit==1.50.0

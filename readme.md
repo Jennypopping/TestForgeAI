@@ -1,0 +1,65 @@
+## 开发问题与解决记录
+
+### 1. DeepSeek API 返回 JSON 不完整
+
+**问题现象：**
+- 点击 AI 分析后，提示 JSON 解析失败。
+- 错误信息：`Expecting property name enclosed in double quotes`。
+- DeepSeek API 请求成功，但返回的 JSON 不完整。
+
+**排查过程：**
+- 检查文档解析：正常，提取 13,287 字符。
+- 检查 API 请求：正常，耗时约 44.56 秒。
+- 检查模型响应：`finish_reason=length`，`completion_tokens=8193`。
+- 定位原因：模型输出达到 Token 上限，导致 JSON 被截断。
+
+**解决方案：**
+- 增加模型响应状态检查，识别 `finish_reason=length`。
+- 将一次性生成全部分析结果改为分阶段生成。
+- 每个阶段独立进行 JSON 解析和 Pydantic 校验，最后合并结果。
+- 增加异常日志，记录模型响应、Token Usage 和错误位置。
+
+**经验总结：**
+LLM 返回 HTTP/API 请求成功，不代表生成内容完整。需要同时校验响应结束原因、JSON 格式及业务数据结构。
+
+### 2. 思考模式下四阶段输出稳定性
+
+DeepSeek 默认思考模式下，reasoning_tokens 与 JSON 输出共享
+`completion_tokens`。固定 8192 会在推理阶段耗尽预算，导致 JSON 截断。
+
+当前方案：
+
+- 保持模型默认思考模式，不发送 `thinking disabled` 或
+  `reasoning_effort=none`。
+- 四个阶段使用独立预算：产品概述 10240、业务规则 14336、潜在风险
+  14336、需求歧义 20480；上限分别为 16384 / 24576 / 24576 / 32768。
+- 预算包含 reasoning 预留，并根据文档长度、模块数量动态上调。
+- 需求歧义阶段在模块数大于 3 时，按模块组（最多 2 组）与
+  歧义 / 冲突 / 信息缺失 3 类问题交叉拆分，并追加 1 个跨模块冲突
+  子任务，最后在 Python 侧合并去重。
+- `finish_reason=length` 一律判定为截断，先拆分任务；无法拆分时才按
+  实际 reasoning_tokens 增量提升预算。
+- JSON 解析或 Pydantic 校验失败时，先用“缩小单次输出范围”的修复提示
+  重试一次；仍失败则拆分任务重试。
+- 每个阶段记录耗时、Prompt / Completion / Reasoning Tokens、
+  finish_reason、请求与重试次数，并在 Streamlit 进度与调试面板展示。
+- 若模型拒绝当前 `max_tokens`，自动减半后重试（最多 3 次），
+  兼容不同 DeepSeek 版本的输出上限。
+
+可调环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DEEPSEEK_MAX_OUTPUT_TOKENS` | 32768 | 全局输出预算上限 |
+| `DEEPSEEK_GENERATION_1_MAX_TOKENS` | 10240 | 阶段 1 预算（显式设置后为硬上限） |
+| `DEEPSEEK_GENERATION_2_MAX_TOKENS` | 14336 | 阶段 2 预算（同上） |
+| `DEEPSEEK_GENERATION_3_MAX_TOKENS` | 14336 | 阶段 3 预算（同上） |
+| `DEEPSEEK_GENERATION_4_MAX_TOKENS` | 20480 | 阶段 4 预算（同上） |
+| `DEEPSEEK_MAX_VALIDATION_RETRIES` | 1 | JSON / 校验失败修复重试次数 |
+| `DEEPSEEK_MAX_TRUNCATION_RECOVERIES` | 2 | 截断拆分恢复层数 |
+
+测试：
+
+```bash
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
