@@ -18,11 +18,16 @@ from services.ai_analyzer import (
     STAGE_SPECS,
     _build_system_prompt,
     _build_subtasks,
+    _assign_requirement_ids,
     _dedupe_analysis_models,
     _dedupe_requirement_items,
     _dedupe_texts,
     _ground_analysis_item,
+    _link_risks_to_requirements,
+    _link_requirements_across_categories,
+    _merge_business_rules,
     _normalize_evidence_text,
+    _reclassify_requirement_items,
 )
 
 
@@ -325,6 +330,280 @@ class AIAnalyzerTests(unittest.TestCase):
                 source_text='原文',
                 analysis='没有说明依据',
             )
+
+    def test_risk_evidence_is_always_inferred_with_test_contract(self):
+        risk = PotentialRiskItem(
+            content='[预约][并发] 并发提交重叠预约 → 重复占用',
+            evidence_type='explicit',
+            source_section='3.2 创建预约',
+            source_text='同一会议室的预约时间不能重叠。',
+            analysis='原文明确要求预约时间不能重叠。',
+            risk_type='并发',
+            expected_behavior='系统应拒绝第二条时间重叠的预约。',
+        )
+
+        self.assertEqual(risk.evidence_type, 'inferred')
+        self.assertIn('推断依据', risk.analysis)
+        self.assertTrue(risk.test_suggestion)
+        self.assertEqual(
+            risk.expected_behavior,
+            '系统应拒绝第二条时间重叠的预约。',
+        )
+        self.assertFalse(risk.needs_product_confirmation)
+
+    def test_risk_without_prd_basis_marks_product_confirmation(self):
+        risk = PotentialRiskItem(
+            content='[会议室管理][数据一致性] 停用会议室 → 未来预约状态不明',
+            evidence_type='inferred',
+            source_section='',
+            source_text='',
+            analysis='推断依据：PRD 未定义停用后未来预约的处理。',
+            risk_type='数据一致性',
+            expected_behavior='系统应自动取消未来预约。',
+        )
+
+        self.assertEqual(risk.expected_behavior, '')
+        self.assertTrue(risk.needs_product_confirmation)
+
+    def test_merge_business_rules_combines_same_source_permissions(self):
+        source_text = '管理员可以新增、编辑和停用会议室。'
+        items = [
+            AnalysisItem(
+                content='[会议室管理][权限] 管理员新增会议室 → 允许新增。',
+                evidence_type='explicit',
+                source_section='3.5 会议室管理',
+                source_text=source_text,
+                analysis='原文明确允许新增。',
+            ),
+            AnalysisItem(
+                content='[会议室管理][权限] 管理员编辑会议室 → 允许编辑。',
+                evidence_type='explicit',
+                source_section='3.5 会议室管理',
+                source_text=source_text,
+                analysis='原文明确允许编辑。',
+            ),
+            AnalysisItem(
+                content='[会议室管理][权限] 管理员停用会议室 → 允许停用。',
+                evidence_type='explicit',
+                source_section='3.5 会议室管理',
+                source_text=source_text,
+                analysis='原文明确允许停用。',
+            ),
+            AnalysisItem(
+                content=(
+                    '[会议室管理][校验] 停用会议室前 → '
+                    '检查是否存在未结束的预约。'
+                ),
+                evidence_type='explicit',
+                source_section='3.5 会议室管理',
+                source_text='停用会议室前需要检查是否存在未结束的预约。',
+                analysis='原文明确要求停用前检查。',
+            ),
+        ]
+
+        merged = _merge_business_rules(items)
+
+        self.assertEqual(len(merged), 2)
+        permission_rule = next(
+            item for item in merged if '[权限]' in item.content
+        )
+        self.assertIn('新增、编辑、停用', permission_rule.content)
+        self.assertEqual(permission_rule.source_text, source_text)
+
+    def test_requirement_reclassification_and_stable_ids(self):
+        q1_item = RequirementItem(
+            content='[创建预约] 预约时间精度未确认。',
+            evidence_type='explicit',
+            source_section='6. 待确认问题',
+            source_text='Q1：预约时间是否允许精确到分钟？',
+            analysis='PRD 明确列为待确认问题。',
+            priority='P1',
+        )
+        missing_as_ambiguity = RequirementItem(
+            content=(
+                '[会议室管理] 停用会议室前检查到未结束预约后'
+                '未说明处理结果；需确认：禁止停用还是继续停用。'
+            ),
+            evidence_type='explicit',
+            source_section='3.5 会议室管理',
+            source_text='停用会议室前需要检查是否存在未结束的预约。',
+            analysis='PRD 未定义检查后的处理规则。',
+            priority='P1',
+        )
+        genuine_ambiguity = RequirementItem(
+            content=(
+                '[创建预约] “提前 7 天”未明确按自然日还是滚动'
+                '168 小时计算；需确认：计算口径。'
+            ),
+            evidence_type='explicit',
+            source_section='4. 业务规则',
+            source_text='预约只能提前 7 天创建。',
+            analysis='已有规则存在两种合理解释。',
+            priority='P1',
+        )
+
+        reclassified = _reclassify_requirement_items({
+            'requirement_conflicts': [],
+            'requirement_ambiguities': [
+                q1_item,
+                missing_as_ambiguity,
+                genuine_ambiguity,
+            ],
+            'missing_requirements': [],
+            'pending_questions': [],
+        })
+        assigned = _assign_requirement_ids(reclassified)
+
+        self.assertEqual(len(assigned['pending_questions']), 1)
+        self.assertEqual(
+            assigned['pending_questions'][0].requirement_id,
+            'Q1',
+        )
+        self.assertEqual(
+            assigned['pending_questions'][0].question_id,
+            'Q1',
+        )
+        self.assertEqual(len(assigned['missing_requirements']), 1)
+        self.assertEqual(
+            assigned['missing_requirements'][0].requirement_id,
+            'M1',
+        )
+        self.assertEqual(len(assigned['requirement_ambiguities']), 1)
+        self.assertEqual(
+            assigned['requirement_ambiguities'][0].requirement_id,
+            'A1',
+        )
+
+    def test_requirement_reclassification_separates_missing_rules(self):
+        filter_ambiguity = RequirementItem(
+            content=(
+                '[会议室列表] 未明确筛选比较方式；需确认：按容纳人数'
+                '精确匹配、最低人数还是区间筛选。'
+            ),
+            evidence_type='explicit',
+            source_section='3.1 会议室列表',
+            source_text='支持按照容纳人数筛选会议室。',
+            analysis='筛选规则未定义。',
+            priority='P1',
+        )
+        name_missing = RequirementItem(
+            content=(
+                '[会议室管理] “会议室名称不能重复”未说明名称比较规则；'
+                '需确认：是否忽略前后空格、大小写及全半角差异。'
+            ),
+            evidence_type='explicit',
+            source_section='3.5 会议室管理',
+            source_text='会议室名称不能重复。',
+            analysis='已有唯一性规则但比较口径存在多种解释。',
+            priority='P2',
+        )
+
+        reclassified = _reclassify_requirement_items({
+            'requirement_conflicts': [],
+            'requirement_ambiguities': [filter_ambiguity],
+            'missing_requirements': [name_missing],
+            'pending_questions': [],
+        })
+
+        self.assertEqual(len(reclassified['missing_requirements']), 1)
+        self.assertIn(
+            '筛选比较方式',
+            reclassified['missing_requirements'][0].content,
+        )
+        self.assertEqual(len(reclassified['requirement_ambiguities']), 1)
+        self.assertIn(
+            '名称比较规则',
+            reclassified['requirement_ambiguities'][0].content,
+        )
+
+    def test_requirement_and_risk_links_use_stable_ids(self):
+        ambiguity = RequirementItem(
+            content='[预约管理] 同一会议室相邻时段是否算重叠未明确。',
+            evidence_type='explicit',
+            source_section='3.2 创建预约',
+            source_text='同一会议室的预约时间不能重叠。',
+            analysis='边界口径存在两种解释。',
+            priority='P1',
+            requirement_id='A1',
+        )
+        missing = RequirementItem(
+            content='[预约记录] 预约状态切换时点未定义。',
+            evidence_type='inferred',
+            source_section='3.4 预约记录',
+            source_text='预约状态包括：待开始、进行中、已结束、已取消。',
+            analysis='推断依据：状态规则未定义。',
+            priority='P1',
+            requirement_id='M1',
+        )
+        linked_requirements = _link_requirements_across_categories({
+            'requirement_conflicts': [],
+            'requirement_ambiguities': [ambiguity],
+            'missing_requirements': [missing],
+            'pending_questions': [],
+        })
+        risk = PotentialRiskItem(
+            content=(
+                '[预约管理][并发] 同时提交同一会议室的相邻重叠时段 '
+                '→ 可能重复占用。'
+            ),
+            evidence_type='inferred',
+            source_section='3.2 创建预约',
+            source_text='同一会议室的预约时间不能重叠。',
+            analysis='推断依据：重叠边界与并发写入可能不一致。',
+            risk_type='并发',
+        )
+        linked_risks = _link_risks_to_requirements(
+            [risk],
+            linked_requirements,
+        )
+
+        self.assertEqual(
+            set(linked_requirements),
+            {
+                'requirement_conflicts',
+                'requirement_ambiguities',
+                'missing_requirements',
+                'pending_questions',
+            },
+        )
+        self.assertEqual(
+            linked_risks[0].related_requirement_id,
+            'A1',
+        )
+
+    def test_risk_links_back_to_original_question_without_deletion(self):
+        pending = RequirementItem(
+            content='管理员停用存在未来预约的会议室时是否自动取消预约？',
+            evidence_type='explicit',
+            source_section='6. 待确认问题',
+            source_text='Q4：管理员停用存在未来预约的会议室时，是否需要自动取消这些预约？',
+            analysis='PRD 明确列为待确认问题。',
+            priority='P1',
+            requirement_id='Q4',
+            question_id='Q4',
+        )
+        risk = PotentialRiskItem(
+            content='[会议室管理][数据一致性] 停用会议室 → 未来预约状态不一致',
+            evidence_type='inferred',
+            source_section='3.5 会议室管理',
+            source_text='停用会议室前需要检查是否存在未结束的预约。',
+            analysis='推断依据：PRD 未定义 Q4 中未来预约的处理方式。',
+            risk_type='数据一致性',
+        )
+
+        linked = _link_risks_to_requirements(
+            [risk],
+            {
+                'requirement_conflicts': [],
+                'requirement_ambiguities': [],
+                'missing_requirements': [],
+                'pending_questions': [pending],
+            },
+        )
+
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(linked[0].related_question_id, 'Q4')
+        self.assertEqual(linked[0].related_requirement_id, '')
 
     def test_fake_explicit_citation_is_downgraded(self):
         item = AnalysisItem(

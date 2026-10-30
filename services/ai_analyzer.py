@@ -246,6 +246,13 @@ EvidenceType = Literal['explicit', 'inferred']
 RequirementPriority = Literal['P0', 'P1', 'P2']
 
 
+def _short_risk_context(content: str, limit: int = 60) -> str:
+    normalized = ' '.join(content.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit - 1] + '…'
+
+
 class AnalysisItem(BaseModel):
     content: str = Field(
         min_length=1,
@@ -265,6 +272,14 @@ class AnalysisItem(BaseModel):
     analysis: str = Field(
         min_length=1,
         description='对该条目的分析说明；inferred 时必须说明推断依据',
+    )
+    related_question_id: str = Field(
+        default='',
+        description='关联的 PRD 原始待确认问题 ID，例如 Q1、Q2',
+    )
+    related_requirement_id: str = Field(
+        default='',
+        description='关联的其他需求问题 ID，例如 A1、M1',
     )
 
     @model_validator(mode='after')
@@ -294,11 +309,67 @@ class PotentialRiskItem(AnalysisItem):
         min_length=1,
         description='风险类型，如并发、权限安全、数据一致性',
     )
+    test_suggestion: str = Field(
+        default='',
+        description='可执行的测试建议，用于验证该风险是否发生',
+    )
+    expected_behavior: str = Field(
+        default='',
+        description='PRD 明确支持的预期行为；无依据时必须为空',
+    )
+    needs_product_confirmation: bool = Field(
+        default=False,
+        description='缺少 PRD 预期行为时标记为需要产品确认',
+    )
+
+    @model_validator(mode='before')
+    @classmethod
+    def force_risk_evidence_type(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        normalized['evidence_type'] = 'inferred'
+        analysis = str(normalized.get('analysis', '')).strip()
+        if not any(
+            marker in analysis.lower()
+            for marker in ('推断依据', '推测依据', '依据：', '基于', 'infer')
+        ):
+            normalized['analysis'] = f'推断依据：{analysis}'
+        return normalized
+
+    @model_validator(mode='after')
+    def validate_risk_contract(self) -> 'PotentialRiskItem':
+        self.evidence_type = 'inferred'
+        analysis = self.analysis.strip()
+        if not any(
+            marker in analysis.lower()
+            for marker in ('推断依据', '推测依据', '依据：', '基于', 'infer')
+        ):
+            self.analysis = f'推断依据：{analysis}'
+
+        if not self.test_suggestion.strip():
+            self.test_suggestion = (
+                f'构造“{_short_risk_context(self.content)}”的触发场景并执行相关操作，'
+                '验证所述影响是否出现，同时核对预约状态、数据一致性和权限结果。'
+            )
+
+        if not self.expected_behavior.strip() or not self.source_text.strip():
+            self.expected_behavior = ''
+            self.needs_product_confirmation = True
+        return self
 
 
 class RequirementItem(AnalysisItem):
     priority: RequirementPriority = Field(
         description='P0 阻塞主流程，P1 影响关键规则，P2 体验或非关键边界',
+    )
+    requirement_id: str = Field(
+        default='',
+        description='需求问题稳定 ID，例如 C1、A1、M1、Q1',
+    )
+    question_id: str = Field(
+        default='',
+        description='PRD 原始待确认问题 ID；仅待确认问题本身填写',
     )
 
 
@@ -462,13 +533,20 @@ _STAGE_OUTPUT_CONTRACTS = {
         '- 影响必须具体到错误状态、数据损坏、越权或泄露、流程中断或统计失真。\n'
         '- 同一根因或同一触发场景只输出一条，合并语义相同但措辞不同的风险，'
         '保留信息更完整的一条；不同根因的风险不得合并。\n'
-        '- 能从 PRD 行为直接验证的标 explicit；基于业务逻辑推断的标 inferred，'
-        '并在 analysis 中写明“推断依据”，且依据必须来自具体 PRD 行为、'
-        '状态或角色限制，不得只写“通常系统会……”；不得把推断包装成确定事实。\n'
+        '- potential_risks 的每一条结论一律标记 evidence_type=inferred，'
+        '即使 source_text 引用了明确的业务规则也不得标记 explicit；'
+        'analysis 必须写明“推断依据”，依据必须来自具体 PRD 行为、状态或角色限制，'
+        '不得只写“通常系统会……”，不得把推断包装成确定事实。\n'
         '- source_text 必须逐字摘录触发该风险的 PRD 原文；找不到依据时置空，'
         '并在 analysis 中说明原因，禁止伪造引用。\n'
+        '- test_suggestion 必须给出可执行的验证思路：说明构造什么场景、执行什么操作、'
+        '观察什么结果；不得把潜在风险描述成已经发生的系统缺陷。\n'
+        '- expected_behavior 只能写 PRD 有明确规则支持的预期行为；'
+        'PRD 未定义时置为空字符串，并把 needs_product_confirmation 设为 true。\n'
+        '- 如果风险与 PRD 已列出的待确认问题（如 Q1、Q2、Q3、Q4）相关，'
+        '填写 related_question_id；不要重复完整描述该待确认问题。\n'
         '- 禁止只写“存在风险”、泛化安全口号、假设性实现缺陷或一般性改进建议。\n'
-        '- 不输出待确认问题、实现建议或测试用例。'
+        '- 不输出待确认问题、实现建议或完整测试用例；test_suggestion 只给出验证方向。'
     ),
     'generation_4': (
         '需求问题输出契约：\n'
@@ -481,18 +559,24 @@ _STAGE_OUTPUT_CONTRACTS = {
         '缺少信息、表述含糊或仅凭推测可能冲突的，不得判为冲突。'
         '“一般性授权 + 更具体的限制/例外”是分层规则，不是冲突，'
         '除非两条描述对同一条件的结论无法同时成立。\n'
-        '- requirement_ambiguities：同一描述存在两种以上会实质影响实现、'
-        '验收或测试的合理解释时使用；不要与冲突或缺失重复。\n'
+        '- requirement_ambiguities：PRD 已有描述，但同一描述存在两种以上会实质影响'
+        '实现、验收或测试的合理解释时使用；不要与冲突或缺失重复。'
+        '如果 PRD 根本没有给出某项必要规则，不得因为没有说明而归类为歧义。\n'
         '- missing_requirements：实现或测试确实需要、但 PRD 完全未定义的信息。'
+        '例如必要的字段、校验、权限、筛选比较方式或状态切换规则缺失。'
         '只有当缺失会影响功能实现、验收标准或测试设计时才输出；'
         'PRD 未提及但不影响当前功能的通用最佳实践不得输出。\n'
-        '- pending_questions：PRD 已明确提出的待确认问题，或必须由产品/业务'
-        '做取舍而无法归入前三类的问题。已经能归入歧义或缺失的问题不要重复放入。\n'
+        '- pending_questions：只放 PRD 明确列出的待确认问题，或必须由产品/业务'
+        '做取舍且无法归入前三类的问题。PRD 中 Q1、Q2、Q3、Q4 等原始问题必须保留在'
+        'pending_questions，并填写 question_id（如 Q1）；不要在歧义或缺失中重复完整问题。'
+        '其他分类中与 Q 编号相关的信息，用 related_question_id 建立关联即可。\n'
         '- 优先级：P0 表示阻塞主流程或无法开发/测试；P1 表示影响关键规则、'
         '数据或权限；P2 表示体验或非关键边界。\n'
         '- content 统一格式：[模块] 具体问题；如需决策，再写“需确认：...”。\n'
         '- 每条都必须填写 evidence_type、source_section、source_text、analysis、'
-        'priority；source_text 必须逐字摘录 PRD，找不到依据时置空并说明原因。\n'
+        'priority；source_text 必须逐字摘录 PRD，找不到依据时置空并说明原因。'
+        '若引用 PRD 原始问题，填写 question_id；若问题由 Q 编号派生，填写 '
+        'related_question_id；关联其他需求问题时填写 related_requirement_id。\n'
         '- 不输出风险分析、实现建议、测试用例或一般性建议。\n'
         '- 同一模块的每个列表最多保留 2 条影响最大的问题；P2 仅保留'
         '确实影响验收或测试判定的事项，避免穷举实现细节。\n'
@@ -2289,6 +2373,10 @@ class AIAnalyzer:
                             field_name in REQUIREMENT_LIST_FIELDS
                         ),
                     )
+                    if field_name == 'business_rules':
+                        deduped_items = _merge_business_rules(
+                            deduped_items
+                        )
                     duplicate_count = len(grounded_items) - len(deduped_items)
                     if duplicate_count:
                         logger.info(
@@ -2311,14 +2399,35 @@ class AIAnalyzer:
                     merged[field_name] = payload[field_name]
                 field_sources[field_name] = spec.key
 
-        deduped_requirements = _dedupe_requirement_items(
+        reclassified_requirements = _reclassify_requirement_items(
             requirement_items
+        )
+        deduped_requirements = _dedupe_requirement_items(
+            reclassified_requirements
+        )
+        deduped_requirements = _assign_requirement_ids(
+            deduped_requirements
+        )
+        deduped_requirements = _link_requirements_across_categories(
+            deduped_requirements
         )
         for field_name in REQUIREMENT_LIST_FIELDS:
             merged[field_name] = [
                 item.model_dump()
                 for item in deduped_requirements[field_name]
             ]
+
+        risk_items = [
+            PotentialRiskItem.model_validate(item)
+            for item in merged.get('potential_risks', [])
+        ]
+        linked_risks = _link_risks_to_requirements(
+            risk_items,
+            deduped_requirements,
+        )
+        merged['potential_risks'] = [
+            item.model_dump() for item in linked_risks
+        ]
 
         expected_fields = set(ProductAnalysis.model_fields)
         missing_fields = expected_fields - set(merged)
@@ -2425,6 +2534,11 @@ def _build_subtasks(
                 'For the listed modules, identify exception cases, boundary '
                 'conditions, permission and security risks, data consistency '
                 'risks, state anomalies, and interrupted flows.'
+                ' Every risk conclusion must use evidence_type=inferred, even '
+                'when source_text quotes an explicit PRD rule. Provide a '
+                'concrete test_suggestion. Only set expected_behavior when a '
+                'PRD rule directly supports it; otherwise leave it empty and '
+                'set needs_product_confirmation=true.'
             )
         batches = _batch_modules(modules, MODULE_BATCH_SIZE)
         if not batches:
@@ -2466,8 +2580,10 @@ def _build_subtasks(
                     'Only populate requirement_ambiguities. Set the other '
                     'three lists to []. Report only phrasing with at least '
                     'two materially different interpretations that affect '
-                    'implementation, acceptance, or testing. Do not report '
-                    'conflicts or product decisions already raised in PRD.'
+                    'implementation, acceptance, or testing. The PRD must '
+                    'already contain a description; do not classify an absent '
+                    'rule as ambiguity. Do not report conflicts or product '
+                    'decisions already raised in PRD.'
                 ),
             ),
             (
@@ -2477,8 +2593,10 @@ def _build_subtasks(
                     'Only populate missing_requirements. Set the other three '
                     'lists to []. Report a required implementation or test '
                     'detail that PRD does not define and whose absence changes '
-                    'behavior or acceptance. Do not report generic best '
-                    'practices, speculative improvements, or conflicts.'
+                    'behavior or acceptance, such as a required field, '
+                    'validation, permission, filter operator, or state '
+                    'transition. Do not report generic best practices, '
+                    'speculative improvements, or conflicts.'
                 ),
             ),
             (
@@ -2487,9 +2605,10 @@ def _build_subtasks(
                 (
                     'Only populate pending_questions. Set the other three '
                     'lists to []. Report questions explicitly raised in PRD '
-                    'or a product/business decision that cannot be classified '
-                    'as conflict, ambiguity, or missing. Do not restate an '
-                    'issue that belongs to one of the first three lists.'
+                    '(keep Q1-Q4 IDs) or a product/business decision that '
+                    'cannot be classified as conflict, ambiguity, or missing. '
+                    'Use related_question_id on derived items instead of '
+                    'restating the complete pending question.'
                 ),
             ),
         )
@@ -3079,6 +3198,399 @@ def _priority_sort_key(item: RequirementItem) -> tuple[int, float]:
     )
 
 
+_QUESTION_ID_RE = re.compile(
+    r'(?<![A-Za-z0-9])Q\s*([1-9]\d*)',
+    re.IGNORECASE,
+)
+
+
+def _extract_question_ids(*texts: str) -> list[str]:
+    question_ids: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for match in _QUESTION_ID_RE.finditer(text):
+            question_id = f'Q{int(match.group(1))}'
+            if question_id not in question_ids:
+                question_ids.append(question_id)
+    return question_ids
+
+
+def _reclassify_requirement_items(
+    items_by_field: Mapping[str, list[RequirementItem]],
+) -> dict[str, list[RequirementItem]]:
+    result = {
+        field_name: list(items_by_field.get(field_name, []))
+        for field_name in REQUIREMENT_LIST_FIELDS
+    }
+
+    for field_name in REQUIREMENT_LIST_FIELDS:
+        if field_name == 'pending_questions':
+            continue
+        retained: list[RequirementItem] = []
+        for item in result[field_name]:
+            question_ids = _extract_question_ids(item.source_text)
+            if question_ids:
+                data = item.model_dump()
+                data.update(
+                    question_id=question_ids[0],
+                    related_question_id=question_ids[0],
+                )
+                result['pending_questions'].append(
+                    RequirementItem.model_validate(data)
+                )
+            else:
+                retained.append(item)
+        result[field_name] = retained
+
+    missing_patterns = (
+        r'缺少',
+        r'没有定义',
+        r'未规定',
+        r'未说明.{0,24}(处理|结果|规则|方式|字段|流程)',
+        r'未定义.{0,36}(规则|边界|方式|字段|流程|切换|处理|校验)',
+        r'筛选.{0,24}(比较方式|匹配规则|比较规则)',
+        r'未(?:明确|确定).{0,24}筛选.{0,16}(比较|匹配)',
+    )
+    ambiguities = result['requirement_ambiguities']
+    retained_ambiguities: list[RequirementItem] = []
+    for item in ambiguities:
+        if any(re.search(pattern, item.content) for pattern in missing_patterns):
+            result['missing_requirements'].append(item)
+        else:
+            retained_ambiguities.append(item)
+    result['requirement_ambiguities'] = retained_ambiguities
+
+    comparison_ambiguity_patterns = (
+        r'名称不能重复.*未(?:说明|明确).*比较',
+        r'名称不能重复.*(?:忽略|大小写|全半角|前后空格)',
+    )
+    retained_missing: list[RequirementItem] = []
+    for item in result['missing_requirements']:
+        if any(
+            re.search(pattern, item.content, re.DOTALL)
+            for pattern in comparison_ambiguity_patterns
+        ):
+            result['requirement_ambiguities'].append(item)
+        else:
+            retained_missing.append(item)
+    result['missing_requirements'] = retained_missing
+    return result
+
+
+def _assign_requirement_ids(
+    items_by_field: Mapping[str, list[RequirementItem]],
+) -> dict[str, list[RequirementItem]]:
+    prefixes = {
+        'requirement_conflicts': 'C',
+        'requirement_ambiguities': 'A',
+        'missing_requirements': 'M',
+        'pending_questions': 'P',
+    }
+    counters = {field_name: 0 for field_name in REQUIREMENT_LIST_FIELDS}
+    result: dict[str, list[RequirementItem]] = {}
+    for field_name in REQUIREMENT_LIST_FIELDS:
+        assigned: list[RequirementItem] = []
+        for item in items_by_field.get(field_name, []):
+            counters[field_name] += 1
+            question_ids = _extract_question_ids(
+                item.source_text,
+                item.content,
+                item.analysis,
+                item.question_id,
+                item.related_question_id,
+            )
+            question_id = question_ids[0] if question_ids else ''
+            if field_name == 'pending_questions' and question_id:
+                requirement_id = question_id
+                assigned_question_id = question_id
+                related_question_id = ''
+            else:
+                requirement_id = (
+                    f'{prefixes[field_name]}{counters[field_name]}'
+                )
+                assigned_question_id = ''
+                related_question_id = question_id
+            assigned.append(item.model_copy(update={
+                'requirement_id': requirement_id,
+                'question_id': assigned_question_id,
+                'related_question_id': related_question_id,
+            }))
+        result[field_name] = assigned
+    return result
+
+
+def _link_requirements_across_categories(
+    items_by_field: Mapping[str, list[RequirementItem]],
+) -> dict[str, list[RequirementItem]]:
+    flattened: list[tuple[str, RequirementItem]] = [
+        (field_name, item)
+        for field_name in REQUIREMENT_LIST_FIELDS
+        for item in items_by_field.get(field_name, [])
+    ]
+    related_ids: dict[int, str] = {}
+    for left_index, (left_field, left_item) in enumerate(flattened):
+        for right_field, right_item in flattened[left_index + 1:]:
+            if left_field == right_field:
+                continue
+            if not left_item.requirement_id or not right_item.requirement_id:
+                continue
+            if not (
+                _evidence_source_fragments(left_item.source_text)
+                & _evidence_source_fragments(right_item.source_text)
+            ):
+                continue
+            score = max(
+                _semantic_similarity(
+                    left_item.content,
+                    right_item.content,
+                ),
+                _requirement_focus_similarity(
+                    left_item.content,
+                    right_item.content,
+                ),
+            )
+            if score < 0.22:
+                continue
+            related_ids[id(left_item)] = _merge_relation_values([
+                related_ids.get(id(left_item), ''),
+                right_item.requirement_id,
+            ])
+            related_ids[id(right_item)] = _merge_relation_values([
+                related_ids.get(id(right_item), ''),
+                left_item.requirement_id,
+            ])
+
+    return {
+        field_name: [
+            item.model_copy(update={
+                'related_requirement_id': _merge_relation_values([
+                    item.related_requirement_id,
+                    related_ids.get(id(item), ''),
+                ]),
+            })
+            for item in items_by_field.get(field_name, [])
+        ]
+        for field_name in REQUIREMENT_LIST_FIELDS
+    }
+
+
+def _merge_relation_values(values: list[str]) -> str:
+    normalized: list[str] = []
+    for value in values:
+        for part in re.split(r'[、,，;；\s]+', value):
+            if part and part not in normalized:
+                normalized.append(part)
+    return '、'.join(normalized)
+
+
+_PERMISSION_ACTION_MARKERS = (
+    ('新增', ('新增', '添加', '创建', '新建')),
+    ('编辑', ('编辑', '修改', '调整')),
+    ('停用', ('停用', '禁用', '关闭')),
+    ('启用', ('启用', '开启')),
+    ('取消', ('取消', '撤销')),
+    ('查看', ('查看', '查询', '浏览')),
+    ('筛选', ('筛选', '过滤')),
+    ('审核', ('审核', '审批')),
+    ('删除', ('删除',)),
+)
+
+
+def _permission_actions(text: str) -> list[str]:
+    return [
+        action
+        for action, markers in _PERMISSION_ACTION_MARKERS
+        if any(marker in text for marker in markers)
+    ]
+
+
+def _permission_actor(text: str) -> str:
+    for actor in ('管理员', '普通员工', '员工'):
+        if actor in text:
+            return actor
+    return ''
+
+
+def _merge_business_rules(
+    items: list[AnalysisItem],
+) -> list[AnalysisItem]:
+    groups: dict[tuple[str, str, str, str], list[AnalysisItem]] = {}
+    for item in items:
+        match = re.match(
+            r'^\s*\[([^\]]+)\]\s*\[([^\]]+)\]\s*(.+)$',
+            item.content,
+        )
+        if match is None or not item.source_text.strip():
+            continue
+        module, rule_type, body = match.groups()
+        if rule_type != '权限':
+            continue
+        actor = _permission_actor(body) or _permission_actor(
+            item.source_text
+        )
+        if not actor:
+            continue
+        source_key = _normalize_evidence_text(item.source_text)
+        groups.setdefault(
+            (source_key, module, rule_type, actor),
+            [],
+        ).append(item)
+
+    mergeable: dict[int, list[AnalysisItem]] = {}
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        actions = _permission_actions(
+            ' '.join(item.content for item in group)
+        )
+        source_key = _normalize_evidence_text(group[0].source_text)
+        if len(actions) < 2:
+            continue
+        if not all(
+            any(
+                marker in source_key
+                for marker in dict(_PERMISSION_ACTION_MARKERS)[action]
+            )
+            for action in actions
+        ):
+            continue
+        for item in group:
+            mergeable[id(item)] = group
+
+    result: list[AnalysisItem] = []
+    emitted_groups: set[int] = set()
+    for item in items:
+        group = mergeable.get(id(item))
+        if group is None:
+            result.append(item)
+            continue
+        group_id = id(group)
+        if group_id in emitted_groups:
+            continue
+        emitted_groups.add(group_id)
+
+        match = re.match(
+            r'^\s*\[([^\]]+)\]\s*\[([^\]]+)\]\s*',
+            item.content,
+        )
+        module = match.group(1) if match else '业务规则'
+        actor = _permission_actor(
+            ' '.join(entry.content for entry in group)
+        )
+        actions = _permission_actions(
+            ' '.join(entry.content for entry in group)
+        )
+        action_text = '、'.join(actions)
+        source_sentence = _normalize_analysis_item(
+            group[0].source_text
+        ).rstrip('。；;')
+        evidence_type: EvidenceType = (
+            'explicit'
+            if all(entry.evidence_type == 'explicit' for entry in group)
+            else 'inferred'
+        )
+        analysis = (
+            f'原文以同一条款授予{actor}对{module}的{action_text}权限，'
+            '操作主体和来源一致，合并为一条权限规则。'
+        )
+        if evidence_type == 'inferred':
+            analysis = f'推断依据：{analysis}'
+        result.append(AnalysisItem.model_validate({
+            'content': (
+                f'[{module}][权限] {source_sentence} → '
+                f'允许{actor}执行{action_text}。'
+            ),
+            'evidence_type': evidence_type,
+            'source_section': group[0].source_section,
+            'source_text': group[0].source_text,
+            'analysis': analysis,
+            'related_question_id': _merge_relation_values([
+                entry.related_question_id for entry in group
+            ]),
+            'related_requirement_id': _merge_relation_values([
+                entry.related_requirement_id for entry in group
+            ]),
+        }))
+    return result
+
+
+def _find_related_requirement(
+    risk: PotentialRiskItem,
+    requirements: list[RequirementItem],
+) -> RequirementItem | None:
+    risk_question_ids = set(_extract_question_ids(
+        risk.source_text,
+        risk.content,
+        risk.analysis,
+        risk.related_question_id,
+    ))
+    if risk_question_ids:
+        for requirement in requirements:
+            question_ids = set(_extract_question_ids(
+                requirement.question_id,
+                requirement.related_question_id,
+                requirement.source_text,
+            ))
+            if risk_question_ids & question_ids:
+                return requirement
+
+    best_requirement: RequirementItem | None = None
+    best_score = 0.0
+    risk_sources = _evidence_source_fragments(risk.source_text)
+    for requirement in requirements:
+        shared_source = bool(
+            risk_sources
+            & _evidence_source_fragments(requirement.source_text)
+        )
+        if not shared_source:
+            continue
+        score = max(
+            _semantic_similarity(risk.content, requirement.content),
+            _requirement_focus_similarity(
+                risk.content,
+                requirement.content,
+            ),
+        )
+        if score >= 0.22 and score > best_score:
+            best_requirement = requirement
+            best_score = score
+    return best_requirement
+
+
+def _link_risks_to_requirements(
+    risks: list[PotentialRiskItem],
+    items_by_field: Mapping[str, list[RequirementItem]],
+) -> list[PotentialRiskItem]:
+    requirements = [
+        item
+        for field_name in REQUIREMENT_LIST_FIELDS
+        for item in items_by_field.get(field_name, [])
+    ]
+    linked: list[PotentialRiskItem] = []
+    for risk in risks:
+        question_ids = _extract_question_ids(
+            risk.source_text,
+            risk.content,
+            risk.analysis,
+            risk.related_question_id,
+        )
+        related = _find_related_requirement(risk, requirements)
+        related_question_id = (
+            related.question_id
+            if related is not None and related.question_id
+            else (question_ids[0] if question_ids else '')
+        )
+        related_requirement_id = ''
+        if related is not None and not related_question_id:
+            related_requirement_id = related.requirement_id
+        linked.append(risk.model_copy(update={
+            'related_question_id': related_question_id,
+            'related_requirement_id': related_requirement_id,
+        }))
+    return linked
+
+
 def _dedupe_requirement_items(
     items_by_field: Mapping[str, list[RequirementItem]],
 ) -> dict[str, list[RequirementItem]]:
@@ -3130,6 +3642,25 @@ def _dedupe_requirement_items(
                 -field_rank[pair[0]],
             ),
         )
+        related_question_id = _merge_relation_values([
+            pair[1].related_question_id for pair in group
+        ])
+        related_requirement_id = _merge_relation_values([
+            pair[1].related_requirement_id for pair in group
+        ])
+        question_id = next(
+            (
+                pair[1].question_id
+                for pair in group
+                if pair[1].question_id
+            ),
+            selected_item.question_id,
+        )
+        selected_item = selected_item.model_copy(update={
+            'related_question_id': related_question_id,
+            'related_requirement_id': related_requirement_id,
+            'question_id': question_id,
+        })
         result[selected_field].append(selected_item)
 
     for field_name in REQUIREMENT_LIST_FIELDS:
@@ -3212,9 +3743,19 @@ def _build_system_prompt(spec: _StageSpec) -> str:
     if spec.key != 'generation_1':
         extra_fields = ''
         if spec.key == 'generation_3':
-            extra_fields = ',\n      "risk_type": "并发"'
+            extra_fields = (
+                ',\n      "risk_type": "并发",'
+                '\n      "test_suggestion": "构造触发场景并执行操作，校验结果",'
+                '\n      "expected_behavior": "PRD 明确的预期行为；无依据时为空字符串",'
+                '\n      "needs_product_confirmation": false,'
+                '\n      "related_question_id": "Q4（不相关时为空字符串）"'
+            )
         elif spec.key == 'generation_4':
-            extra_fields = ',\n      "priority": "P1"'
+            extra_fields = (
+                ',\n      "priority": "P1",'
+                '\n      "question_id": "Q1（仅原始待确认问题填写）",'
+                '\n      "related_question_id": "Q3（派生关联时填写）"'
+            )
         evidence_contract = f'''
     分析条目统一结构：
     {{
@@ -3228,6 +3769,7 @@ def _build_system_prompt(spec: _StageSpec) -> str:
     证据与引用规则：
     - explicit 表示 PRD 原文明确描述；必须提供逐字摘录的 source_text。
     - inferred 表示根据 PRD 原文推断；analysis 必须以“推断依据：”说明推断依据。
+    - potential_risks 的所有结论一律为 inferred，即使引用的是明确业务规则。
     - source_text 必须能在 PRD 中逐字找到，不得改写、概括、拼接或编造。
     - source_section 必须使用 PRD 中的实际章节标题；无法确认时置为空字符串。
     - 找不到原文依据时，把 source_section 和 source_text 置为空，并在 analysis 中说明原因。
@@ -3260,6 +3802,7 @@ def _build_system_prompt(spec: _StageSpec) -> str:
     - 合并语义相同、表达不同的条目，保留信息更完整、描述更准确的一条。
     - 不得为了减少数量而合并触发条件、角色、状态或结果不同的实际业务规则。
     - 同一根因或同一需求问题只能出现一次，禁止同义改写、近义重复和跨分类重复。
+    - 如风险与其他分类内容指向同一问题，保留两侧信息，并用 related_question_id 或 related_requirement_id 建立关联。
     - 每个推断都必须在 analysis 中明确写出“推断依据：”，不得把推断伪装成明确需求。
     - 输出保持精炼，避免与当前阶段无关的重复内容。
     '''

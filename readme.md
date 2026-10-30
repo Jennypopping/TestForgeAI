@@ -36,11 +36,11 @@ DeepSeek 默认思考模式下，reasoning_tokens 与 JSON 输出共享
 - 保持模型默认思考模式，不发送 `thinking disabled` 或
   `reasoning_effort=none`。
 - 四个阶段使用独立预算：产品概述 10240、业务规则 14336、潜在风险
-  14336、需求歧义 20480；上限分别为 16384 / 24576 / 24576 / 32768。
+  14336、需求问题 20480；上限分别为 16384 / 24576 / 24576 / 32768。
 - 预算包含 reasoning 预留，并根据文档长度、模块数量动态上调。
-- 需求歧义阶段在模块数大于 3 时，按模块组（最多 2 组）与
-  歧义 / 冲突 / 信息缺失 3 类问题交叉拆分，并追加 1 个跨模块冲突
-  子任务，最后在 Python 侧合并去重。
+- 需求问题阶段在模块数大于 3 时，按模块组（最多 2 组）与
+  冲突 / 歧义 / 缺失 / 待确认 4 类问题交叉拆分，并追加 1 个跨模块
+  一致性检查子任务，最后在 Python 侧合并去重。
 - `finish_reason=length` 一律判定为截断，先拆分任务；无法拆分时才按
   实际 reasoning_tokens 增量提升预算。
 - JSON 解析或 Pydantic 校验失败时，先用“缩小单次输出范围”的修复提示
@@ -102,3 +102,36 @@ DeepSeek 默认思考模式下，reasoning_tokens 与 JSON 输出共享
 提高 AI 需求分析的准确性、可追溯性和可验证性，为后续测试点生成、测试用例生成提供可靠的数据基础。
 
 **核心原则：AI 辅助分析，人工验证结论。**
+
+## 5. 第二轮分析质量优化
+
+### evidence_type 统一定义
+
+- `explicit`：当前结论由 PRD 原文直接明确描述。
+- `inferred`：当前结论由 AI 根据 PRD 内容推导得出。
+- `potential_risks` 一律使用 `inferred`；即使引用明确业务规则，也不把风险结论标记为 `explicit`。
+- `source_text` 始终引用真实 PRD 原文，不因证据类型调整而改变。
+
+### 四类问题分类
+
+- `requirement_conflicts`：PRD 中存在相互矛盾的要求。
+- `requirement_ambiguities`：已有描述，但存在多种会实质影响实现或测试的合理解释。
+- `missing_requirements`：影响实现或测试的必要规则没有定义。
+- `pending_questions`：PRD 明确列出的待产品确认事项，保留 Q1-Q4 原始编号。
+
+### 关联与归并
+
+- 需求问题增加稳定 `requirement_id`；原始待确认问题增加 `question_id`。
+- 派生问题使用 `related_question_id` 关联 Q 编号，使用 `related_requirement_id` 关联其他需求问题。
+- 风险与需求问题指向同一问题时保留两侧信息，通过关联字段建立关系，不机械删除。
+- 同一原文、同一模块、同一角色的并列权限操作可以合并；不同校验、权限或状态规则不强行合并。
+
+### 数据结构变化
+
+- 风险条目新增 `test_suggestion`、`expected_behavior`、`needs_product_confirmation`、`related_question_id`、`related_requirement_id`。
+- 需求问题新增 `requirement_id`、`question_id`、`related_question_id`、`related_requirement_id`。
+- PRD 未定义预期行为时，`expected_behavior` 为空，`needs_product_confirmation=true`。
+
+### 会议室 PRD 复分析结果
+
+结果保存在 `src/meeting-room-product_analysis_round2.json`：业务规则 27 条、潜在风险 6 条、冲突 0 条、歧义 4 条、缺失 5 条、待确认问题 4 条。管理员新增/编辑/停用会议室已合并为一条权限规则，Q1-Q4 保留在待确认问题中。
