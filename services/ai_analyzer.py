@@ -6,12 +6,13 @@ import os
 import re
 import time
 import traceback
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping, Optional, Type
 
 from dotenv import load_dotenv
 from openai import APIConnectionError, APITimeoutError, APIError, OpenAI
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 load_dotenv()
 
@@ -66,7 +67,16 @@ DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 ANALYSIS_LIST_FIELDS = (
     'business_rules',
     'potential_risks',
-    'ambiguous_requirements',
+    'requirement_conflicts',
+    'requirement_ambiguities',
+    'missing_requirements',
+    'pending_questions',
+)
+REQUIREMENT_LIST_FIELDS = (
+    'requirement_conflicts',
+    'requirement_ambiguities',
+    'missing_requirements',
+    'pending_questions',
 )
 
 
@@ -232,31 +242,96 @@ class ProductOverviewSection(BaseModel):
     )
 
 
+EvidenceType = Literal['explicit', 'inferred']
+RequirementPriority = Literal['P0', 'P1', 'P2']
+
+
+class AnalysisItem(BaseModel):
+    content: str = Field(
+        min_length=1,
+        description='具体业务规则、风险或需求问题',
+    )
+    evidence_type: EvidenceType = Field(
+        description='explicit 表示 PRD 原文明确描述；inferred 表示基于原文推断',
+    )
+    source_section: str = Field(
+        default='',
+        description='PRD 来源章节；无法定位时为空',
+    )
+    source_text: str = Field(
+        default='',
+        description='PRD 原文片段，必须逐字引用；无法定位时为空',
+    )
+    analysis: str = Field(
+        min_length=1,
+        description='对该条目的分析说明；inferred 时必须说明推断依据',
+    )
+
+    @model_validator(mode='after')
+    def validate_evidence_contract(self) -> 'AnalysisItem':
+        if self.evidence_type == 'explicit' and not self.source_text.strip():
+            raise ValueError(
+                'evidence_type=explicit 时必须提供 source_text 原文依据'
+            )
+        if self.evidence_type == 'inferred':
+            analysis = self.analysis.strip().lower()
+            inference_markers = (
+                '推断依据',
+                '推测依据',
+                '依据：',
+                '基于',
+                'infer',
+            )
+            if not any(marker in analysis for marker in inference_markers):
+                raise ValueError(
+                    'evidence_type=inferred 时 analysis 必须说明推断依据'
+                )
+        return self
+
+
+class PotentialRiskItem(AnalysisItem):
+    risk_type: str = Field(
+        min_length=1,
+        description='风险类型，如并发、权限安全、数据一致性',
+    )
+
+
+class RequirementItem(AnalysisItem):
+    priority: RequirementPriority = Field(
+        description='P0 阻塞主流程，P1 影响关键规则，P2 体验或非关键边界',
+    )
+
+
 class BusinessRulesSection(BaseModel):
-    business_rules: list[str] = Field(
+    business_rules: list[AnalysisItem] = Field(
         description=(
-            '原子、可验证的业务规则，格式为 '
-            '[模块][规则类型] 触发条件/操作 → 预期结果'
+            '原子、可验证的业务规则；content 采用 '
+            '[模块][规则类型] 触发条件/操作 → 预期结果 格式'
         )
     )
 
 
 class PotentialRisksSection(BaseModel):
-    potential_risks: list[str] = Field(
+    potential_risks: list[PotentialRiskItem] = Field(
         description=(
-            '潜在风险，格式为 '
-            '[模块][风险类型] 触发场景 → 可能影响'
+            '潜在风险；content 采用 '
+            '[模块][风险类型] 触发场景 → 可能影响 格式'
         )
     )
 
 
-class AmbiguousRequirementsSection(BaseModel):
-    ambiguous_requirements: list[str] = Field(
-        description=(
-            '按优先级排序的待确认问题，格式为 '
-            '[P0|P1|P2][模块][歧义|冲突|缺失] '
-            '待确认点：...；需确认：...'
-        )
+class RequirementsAnalysisSection(BaseModel):
+    requirement_conflicts: list[RequirementItem] = Field(
+        description='PRD 原文存在相互矛盾描述的需求冲突',
+    )
+    requirement_ambiguities: list[RequirementItem] = Field(
+        description='描述不明确、可能存在多种合理解释的需求歧义',
+    )
+    missing_requirements: list[RequirementItem] = Field(
+        description='实现或测试所需且 PRD 未定义的信息',
+    )
+    pending_questions: list[RequirementItem] = Field(
+        description='需要产品或业务人员进一步确认的问题',
     )
 
 
@@ -267,15 +342,34 @@ class ProductAnalysis(BaseModel):
     core_features: list[str] = Field(
         description='产品核心功能模块'
     )
-    business_rules: list[str] = Field(
+    business_rules: list[AnalysisItem] = Field(
         description='原子、可验证的产品业务规则'
     )
-    potential_risks: list[str] = Field(
+    potential_risks: list[PotentialRiskItem] = Field(
         description='带触发场景和影响说明的潜在风险'
     )
-    ambiguous_requirements: list[str] = Field(
-        description='按优先级排序的歧义、冲突、缺失与待确认问题'
+    requirement_conflicts: list[RequirementItem] = Field(
+        description='PRD 中存在明确矛盾描述的需求冲突'
     )
+    requirement_ambiguities: list[RequirementItem] = Field(
+        description='描述不明确或存在多种理解的需求歧义'
+    )
+    missing_requirements: list[RequirementItem] = Field(
+        description='实现或测试所需但 PRD 未定义的信息'
+    )
+    pending_questions: list[RequirementItem] = Field(
+        description='需要产品或业务人员进一步确认的问题'
+    )
+
+
+ANALYSIS_FIELD_MODELS: dict[str, Type[AnalysisItem]] = {
+    'business_rules': AnalysisItem,
+    'potential_risks': PotentialRiskItem,
+    'requirement_conflicts': RequirementItem,
+    'requirement_ambiguities': RequirementItem,
+    'missing_requirements': RequirementItem,
+    'pending_questions': RequirementItem,
+}
 
 
 @dataclass(frozen=True)
@@ -327,11 +421,12 @@ STAGE_SPECS = (
     ),
     _StageSpec(
         key='generation_4',
-        label='需求歧义与待确认问题',
-        schema=AmbiguousRequirementsSection,
+        label='需求冲突、歧义、缺失与待确认问题',
+        schema=RequirementsAnalysisSection,
         focus=(
-            '只生成 ambiguous_requirements。将描述含糊、信息缺失、'
-            '规则冲突以及需要产品经理确认的问题统一放入该列表。'
+            '只生成 requirement_conflicts、requirement_ambiguities、'
+            'missing_requirements、pending_questions 四个列表。'
+            '每个问题只能进入最合适的一个列表，绝不能重复归类。'
         ),
     ),
 )
@@ -341,34 +436,67 @@ _STAGE_OUTPUT_CONTRACTS = {
     'generation_2': (
         '业务规则输出契约：\n'
         '- 每条只描述一个原子、可验证的业务规则；不同条件、角色或状态不得混写。\n'
-        '- 统一格式：[模块][规则类型] 触发条件/操作 → 预期结果。\n'
+        '- content 统一格式：[模块][规则类型] 触发条件/操作 → 预期结果。\n'
         '- 规则类型仅使用：状态流转、权限、条件约束、校验、数据约束、通知。\n'
-        '- 只输出文档明确表达或可直接推导的规则；文档未定义的细节不得补全。\n'
-        '- 同一规则只出现一次；同一状态机的通过/拒绝等分支应分别给出结果，'
-        '但不要重复相同前置条件。\n'
+        '- 优先提取文档明确表达的规则并标记 explicit；'
+        '只有业务逻辑可由原文直接推出时才标记 inferred，'
+        '且 analysis 必须写明“推断依据”。\n'
+        '- 同一规则在多个章节重复出现时只输出一条，保留信息更完整、'
+        '来源更直接的一条；不同触发条件、角色、状态或结果的规则不得合并。\n'
+        '- 原文用并列动词列出多个独立操作时（如“新增、编辑和停用”），'
+        '每个操作必须单独输出，不得合并成一条，也不得遗漏其中任一操作。\n'
+        '- 原文没有依据的内容不要输出为业务规则。\n'
+        '- source_text 必须逐字摘录 PRD；不得改写、概括或拼接出原文不存在的句子。\n'
         '- 不输出风险、待确认问题、实现建议或测试步骤。'
     ),
     'generation_3': (
         '潜在风险输出契约：\n'
-        '- 每条只描述一个独立风险，必须由文档中的明确行为、约束缺失或流程冲突触发。\n'
-        '- 统一格式：[模块][风险类型] 触发场景 → 可能影响。\n'
-        '- 风险类型仅使用：边界条件、异常流程、并发、权限安全、'
+        '- 每条只描述一个独立风险，必须由文档中的明确行为、状态、角色或约束触发。\n'
+        '- 每个模块最多保留 2 条影响最大的风险；优先级相同的情况下，'
+        '选择最可能破坏主流程、数据一致性或权限边界的风险。\n'
+        '- 不要假设系统“没有事务锁”“没有服务端校验”等实现缺陷；'
+        '除非 PRD 明确说明该行为，否则不得把通用技术缺陷当作本项目风险。\n'
+        '- content 统一格式：[模块][风险类型] 触发场景 → 可能影响。\n'
+        '- risk_type 仅使用：边界条件、异常流程、并发、权限安全、'
         '数据一致性、性能可用性、集成兼容。\n'
         '- 影响必须具体到错误状态、数据损坏、越权或泄露、流程中断或统计失真。\n'
-        '- 合并同一根因的重复项，禁止只写“存在风险”或泛化的安全口号。\n'
+        '- 同一根因或同一触发场景只输出一条，合并语义相同但措辞不同的风险，'
+        '保留信息更完整的一条；不同根因的风险不得合并。\n'
+        '- 能从 PRD 行为直接验证的标 explicit；基于业务逻辑推断的标 inferred，'
+        '并在 analysis 中写明“推断依据”，且依据必须来自具体 PRD 行为、'
+        '状态或角色限制，不得只写“通常系统会……”；不得把推断包装成确定事实。\n'
+        '- source_text 必须逐字摘录触发该风险的 PRD 原文；找不到依据时置空，'
+        '并在 analysis 中说明原因，禁止伪造引用。\n'
+        '- 禁止只写“存在风险”、泛化安全口号、假设性实现缺陷或一般性改进建议。\n'
         '- 不输出待确认问题、实现建议或测试用例。'
     ),
     'generation_4': (
-        '需求歧义输出契约：\n'
-        '- 每条只描述一个可确认的问题；同一根因必须合并，禁止同义改写重复。\n'
-        '- 统一格式：[P0|P1|P2][模块][歧义|冲突|缺失] '
-        '待确认点：...；需确认：...。\n'
+        '需求问题输出契约：\n'
+        '- JSON 必须包含且仅包含四个列表：requirement_conflicts、'
+        'requirement_ambiguities、missing_requirements、pending_questions。\n'
+        '- 每个问题只能进入一个列表，按最根本的问题性质分类；'
+        '同一根因不得在不同列表或同一列表中重复出现。\n'
+        '- requirement_conflicts：通常应为空；只有 PRD 中存在两条可逐字引用的描述，'
+        '且二者语义直接矛盾时才使用；source_text 用“｜”连接两段原文。'
+        '缺少信息、表述含糊或仅凭推测可能冲突的，不得判为冲突。'
+        '“一般性授权 + 更具体的限制/例外”是分层规则，不是冲突，'
+        '除非两条描述对同一条件的结论无法同时成立。\n'
+        '- requirement_ambiguities：同一描述存在两种以上会实质影响实现、'
+        '验收或测试的合理解释时使用；不要与冲突或缺失重复。\n'
+        '- missing_requirements：实现或测试确实需要、但 PRD 完全未定义的信息。'
+        '只有当缺失会影响功能实现、验收标准或测试设计时才输出；'
+        'PRD 未提及但不影响当前功能的通用最佳实践不得输出。\n'
+        '- pending_questions：PRD 已明确提出的待确认问题，或必须由产品/业务'
+        '做取舍而无法归入前三类的问题。已经能归入歧义或缺失的问题不要重复放入。\n'
         '- 优先级：P0 表示阻塞主流程或无法开发/测试；P1 表示影响关键规则、'
         '数据或权限；P2 表示体验或非关键边界。\n'
-        '- 只列 PRD 的含糊、矛盾、缺失约束或不可验证描述，不输出风险分析、'
-        '实现建议或测试用例。\n'
-        '- 按 P0、P1、P2 顺序输出；每个模块优先保留影响最大的问题，'
-        '避免穷举所有可能分支。'
+        '- content 统一格式：[模块] 具体问题；如需决策，再写“需确认：...”。\n'
+        '- 每条都必须填写 evidence_type、source_section、source_text、analysis、'
+        'priority；source_text 必须逐字摘录 PRD，找不到依据时置空并说明原因。\n'
+        '- 不输出风险分析、实现建议、测试用例或一般性建议。\n'
+        '- 同一模块的每个列表最多保留 2 条影响最大的问题；P2 仅保留'
+        '确实影响验收或测试判定的事项，避免穷举实现细节。\n'
+        '- 同一模块按 P0、P1、P2 排序，只保留影响最大的问题，避免穷举。'
     ),
 }
 
@@ -781,7 +909,11 @@ class AIAnalyzer:
             )
 
         try:
-            analysis = self._merge_stage_results(stage_payloads, trace)
+            analysis = self._merge_stage_results(
+                stage_payloads,
+                trace,
+                document_content,
+            )
         except AIAnalysisError as exc:
             self._record_exception(trace, exc)
             self._emit(
@@ -1432,7 +1564,7 @@ class AIAnalyzer:
                 for payload in payloads
             ]
             if any(isinstance(value, list) for value in values):
-                merged[field_name] = _dedupe_texts(
+                merged[field_name] = _merge_raw_list_items(
                     item
                     for value in values
                     if isinstance(value, list)
@@ -2071,6 +2203,7 @@ class AIAnalyzer:
         self,
         stage_payloads: Mapping[str, Mapping[str, Any]],
         trace: AIAnalysisTrace,
+        document_content: str = '',
     ) -> ProductAnalysis:
         expected_stage_keys = [spec.key for spec in STAGE_SPECS]
         missing_stages = [
@@ -2088,7 +2221,10 @@ class AIAnalyzer:
 
         merged: dict[str, Any] = {}
         field_sources: dict[str, str] = {}
-        seen_analysis_items: set[str] = set()
+        requirement_items: dict[str, list[RequirementItem]] = {
+            field_name: [] for field_name in REQUIREMENT_LIST_FIELDS
+        }
+        normalized_document = _normalize_evidence_text(document_content)
         for spec in STAGE_SPECS:
             payload = stage_payloads[spec.key]
             expected_fields = set(spec.schema.model_fields)
@@ -2116,27 +2252,73 @@ class AIAnalyzer:
                         details={'duplicate_field': field_name},
                     )
                 if field_name in ANALYSIS_LIST_FIELDS:
-                    items = _dedupe_texts(payload[field_name])
-                    unique_items = []
-                    duplicate_count = 0
-                    for item in items:
-                        fingerprint = _text_fingerprint(item)
-                        if fingerprint in seen_analysis_items:
-                            duplicate_count += 1
-                            continue
-                        seen_analysis_items.add(fingerprint)
-                        unique_items.append(item)
+                    model_cls = ANALYSIS_FIELD_MODELS[field_name]
+                    grounded_items: list[AnalysisItem] = []
+                    try:
+                        for value in payload[field_name]:
+                            item = (
+                                value
+                                if isinstance(value, model_cls)
+                                else model_cls.model_validate(value)
+                            )
+                            grounded_items.append(
+                                _ground_analysis_item(
+                                    item,
+                                    normalized_document,
+                                    document_content,
+                                )
+                            )
+                    except ValidationError as exc:
+                        field_errors = _extract_validation_errors(exc)
+                        trace.validation_error = _sanitize_text(str(exc))
+                        trace.validation_field_errors = field_errors
+                        raise AIValidationError(
+                            f'字段「{field_name}」校验失败：'
+                            f'{_format_field_errors(field_errors)}',
+                            trace=trace,
+                            stage='final',
+                            details={
+                                'field_name': field_name,
+                                'field_errors': field_errors,
+                            },
+                        ) from exc
+
+                    deduped_items = _dedupe_analysis_models(
+                        grounded_items,
+                        same_source_is_duplicate=(
+                            field_name in REQUIREMENT_LIST_FIELDS
+                        ),
+                    )
+                    duplicate_count = len(grounded_items) - len(deduped_items)
                     if duplicate_count:
                         logger.info(
-                            'Removed cross-field duplicate analysis items: '
-                            'field=%s count=%d',
+                            'Merged semantically duplicate analysis items: '
+                            'field=%s removed=%d',
                             field_name,
                             duplicate_count,
                         )
-                    merged[field_name] = unique_items
+                    if field_name in REQUIREMENT_LIST_FIELDS:
+                        requirement_items[field_name] = [
+                            item
+                            for item in deduped_items
+                            if isinstance(item, RequirementItem)
+                        ]
+                    else:
+                        merged[field_name] = [
+                            item.model_dump() for item in deduped_items
+                        ]
                 else:
                     merged[field_name] = payload[field_name]
                 field_sources[field_name] = spec.key
+
+        deduped_requirements = _dedupe_requirement_items(
+            requirement_items
+        )
+        for field_name in REQUIREMENT_LIST_FIELDS:
+            merged[field_name] = [
+                item.model_dump()
+                for item in deduped_requirements[field_name]
+            ]
 
         expected_fields = set(ProductAnalysis.model_fields)
         missing_fields = expected_fields - set(merged)
@@ -2267,29 +2449,47 @@ def _build_subtasks(
     if spec.key == 'generation_4':
         subtask_specs = (
             (
-                'ambiguity',
-                'A. 需求歧义识别',
-                (
-                    'Only identify ambiguous, vague, or underspecified '
-                    'requirement descriptions. Do not report conflicts in '
-                    'this subtask.'
-                ),
-            ),
-            (
                 'conflicts',
-                'B. 需求冲突识别',
+                'A. 需求冲突识别',
                 (
-                    'Only identify contradictions, inconsistencies, and '
-                    'conflicts between requirements, rules, states, or roles.'
+                    'Only populate requirement_conflicts. Set the other three '
+                    'lists to []. A conflict requires two explicit PRD '
+                    'statements that cannot both be true. Quote both exact '
+                    'excerpts in source_text separated by “｜”. Missing '
+                    'details or speculative concerns are not conflicts.'
                 ),
             ),
             (
-                'missing_info',
-                'C. 信息缺失与待确认问题',
+                'ambiguities',
+                'B. 需求歧义识别',
                 (
-                    'Only list missing information, missing boundary '
-                    'conditions, and questions requiring product owner '
-                    'confirmation.'
+                    'Only populate requirement_ambiguities. Set the other '
+                    'three lists to []. Report only phrasing with at least '
+                    'two materially different interpretations that affect '
+                    'implementation, acceptance, or testing. Do not report '
+                    'conflicts or product decisions already raised in PRD.'
+                ),
+            ),
+            (
+                'missing',
+                'C. 需求缺失识别',
+                (
+                    'Only populate missing_requirements. Set the other three '
+                    'lists to []. Report a required implementation or test '
+                    'detail that PRD does not define and whose absence changes '
+                    'behavior or acceptance. Do not report generic best '
+                    'practices, speculative improvements, or conflicts.'
+                ),
+            ),
+            (
+                'pending',
+                'D. 待确认问题识别',
+                (
+                    'Only populate pending_questions. Set the other three '
+                    'lists to []. Report questions explicitly raised in PRD '
+                    'or a product/business decision that cannot be classified '
+                    'as conflict, ambiguity, or missing. Do not restate an '
+                    'issue that belongs to one of the first three lists.'
                 ),
             ),
         )
@@ -2346,9 +2546,10 @@ def _build_subtasks(
                     label='D. 跨模块冲突与一致性',
                     focus=(
                         f'{spec.focus}\n'
-                        'Only identify contradictions or inconsistencies '
-                        'that span different feature modules, roles, or '
-                        'states. Do not repeat per-module ambiguities.'
+                        'Only identify cross-module contradictions or '
+                        'inconsistencies that span feature modules, roles, or '
+                        'states. Classify each into exactly one of the four '
+                        'lists. Do not repeat per-module issues.'
                     ),
                     source_titles=('完整文档',),
                     document_text=document_content,
@@ -2442,6 +2643,500 @@ def _dedupe_texts(values: Any) -> list[str]:
     return result
 
 
+def _merge_raw_list_items(values: Any) -> list[Any]:
+    result: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values:
+        if isinstance(value, str):
+            text = _normalize_analysis_item(value)
+            if not text:
+                continue
+            key = ('text', _text_fingerprint(text))
+            item: Any = text
+        elif isinstance(value, dict):
+            key = (
+                'dict',
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+            item = value
+        else:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _normalize_evidence_text(text: str) -> str:
+    return re.sub(
+        r'[\s#>*_`~“”"\'‘’（）()\[\]【】{}，。；、,.!?！？:：\-—|｜]+',
+        '',
+        text,
+    ).casefold()
+
+
+def _evidence_source_fragments(source_text: str) -> set[str]:
+    return {
+        normalized
+        for part in re.split(r'\s*(?:｜|\|\||\n+)\s*', source_text)
+        if part.strip()
+        for normalized in (_normalize_evidence_text(part),)
+        if normalized
+    }
+
+
+def _source_text_is_grounded(
+    source_text: str,
+    normalized_document: str,
+) -> bool:
+    normalized_source = _normalize_evidence_text(source_text)
+    if not normalized_source:
+        return False
+    if normalized_source in normalized_document:
+        return True
+
+    parts = list(_evidence_source_fragments(source_text))
+    return (
+        len(parts) > 1
+        and all(len(part) >= 4 for part in parts)
+        and all(part in normalized_document for part in parts)
+    )
+
+
+def _sections_for_source_text(
+    source_text: str,
+    document_content: str,
+) -> list[str]:
+    fragments = sorted(
+        _evidence_source_fragments(source_text),
+        key=len,
+        reverse=True,
+    )
+    if not fragments:
+        return []
+
+    matched_titles: list[str] = []
+    for title, section_text in _split_document_sections(document_content):
+        normalized_section = _normalize_evidence_text(section_text)
+        if any(fragment in normalized_section for fragment in fragments):
+            if title not in matched_titles:
+                matched_titles.append(title)
+    return matched_titles
+
+
+def _canonicalize_source_section(
+    source_section: str,
+    document_content: str,
+) -> str:
+    raw_parts = [
+        part.strip()
+        for part in re.split(r'\s*[；;]\s*', source_section)
+        if part.strip()
+    ]
+    if not raw_parts:
+        return ''
+
+    section_titles = [
+        title
+        for title, _ in _split_document_sections(document_content)
+    ]
+    normalized_titles = {
+        _normalize_evidence_text(title): title
+        for title in section_titles
+    }
+    canonical_parts: list[str] = []
+    for part in raw_parts:
+        normalized_part = _normalize_evidence_text(part)
+        canonical = normalized_titles.get(normalized_part)
+        if canonical is None:
+            candidates = [
+                title
+                for normalized_title, title in normalized_titles.items()
+                if (
+                    normalized_part
+                    and (
+                        normalized_part in normalized_title
+                        or normalized_title in normalized_part
+                    )
+                )
+            ]
+            if len(candidates) == 1:
+                canonical = candidates[0]
+        if canonical and canonical not in canonical_parts:
+            canonical_parts.append(canonical)
+    return '；'.join(canonical_parts)
+
+
+def _ground_analysis_item(
+    item: AnalysisItem,
+    normalized_document: str,
+    document_content: str = '',
+) -> AnalysisItem:
+    if not normalized_document or not item.source_text.strip():
+        if not document_content or not item.source_section.strip():
+            return item
+        source_section = _canonicalize_source_section(
+            item.source_section,
+            document_content,
+        )
+        if source_section == item.source_section:
+            return item
+        data = item.model_dump()
+        data['source_section'] = source_section
+        return type(item).model_validate(data)
+    if _source_text_is_grounded(item.source_text, normalized_document):
+        if not document_content:
+            return item
+        source_sections = _sections_for_source_text(
+            item.source_text,
+            document_content,
+        )
+        source_section = '；'.join(source_sections)
+        if source_section == item.source_section:
+            return item
+        data = item.model_dump()
+        data['source_section'] = source_section
+        return type(item).model_validate(data)
+
+    analysis = item.analysis.strip()
+    note = (
+        '模型提供的原文片段未能在 PRD 中逐字定位，已移除该引用。'
+    )
+    if item.evidence_type == 'inferred':
+        analysis = f'{note}推断依据：{analysis}'
+    else:
+        analysis = (
+            f'{note}本项已由 explicit 降级为 inferred，'
+            f'推断依据：{analysis}'
+        )
+
+    data = item.model_dump()
+    data.update(
+        evidence_type='inferred',
+        source_section='',
+        source_text='',
+        analysis=analysis,
+    )
+    return type(item).model_validate(data)
+
+
+def _analysis_content_key(text: str) -> str:
+    normalized = _text_fingerprint(text)
+    for phrase in (
+        '系统',
+        '功能',
+        '需要',
+        '必须',
+        '应当',
+        '要求',
+        '可以',
+        '进行',
+        '实现',
+    ):
+        normalized = normalized.replace(phrase, '')
+    return normalized
+
+
+_REQUIREMENT_FOCUS_STOP_PHRASES = (
+    '会议室',
+    '管理员',
+    '普通员工',
+    '员工',
+    '预约',
+    '创建',
+    '取消',
+    '记录',
+    '管理',
+    '功能',
+    '系统',
+    '规则',
+    '要求',
+    '需要',
+    '必须',
+    '可以',
+    '进行',
+    '实现',
+    '未定义',
+    '需确认',
+    '存在',
+    '是否',
+    '以及',
+    '如果',
+    '可能',
+    '影响',
+    '当前',
+    '不同',
+    '包括',
+)
+
+
+def _requirement_focus_key(text: str) -> str:
+    normalized = _text_fingerprint(text)
+    for phrase in _REQUIREMENT_FOCUS_STOP_PHRASES:
+        normalized = normalized.replace(phrase, '')
+    return normalized
+
+
+def _requirement_focus_similarity(left: str, right: str) -> float:
+    left_key = _requirement_focus_key(left)
+    right_key = _requirement_focus_key(right)
+    if not left_key or not right_key:
+        return 0.0
+    return SequenceMatcher(None, left_key, right_key).ratio()
+
+
+def _char_ngrams(text: str, size: int = 2) -> set[str]:
+    if len(text) <= size:
+        return {text} if text else set()
+    return {text[index:index + size] for index in range(len(text) - size + 1)}
+
+
+def _semantic_similarity(left: str, right: str) -> float:
+    left_key = _analysis_content_key(left)
+    right_key = _analysis_content_key(right)
+    if not left_key or not right_key:
+        return 0.0
+    if left_key == right_key:
+        return 1.0
+
+    sequence_score = SequenceMatcher(
+        None,
+        left_key,
+        right_key,
+    ).ratio()
+    left_grams = _char_ngrams(left_key)
+    right_grams = _char_ngrams(right_key)
+    union = left_grams | right_grams
+    jaccard_score = (
+        len(left_grams & right_grams) / len(union)
+        if union
+        else 0.0
+    )
+    containment_score = (
+        min(len(left_key), len(right_key))
+        / max(len(left_key), len(right_key))
+        if (left_key in right_key or right_key in left_key)
+        else 0.0
+    )
+    return max(sequence_score, jaccard_score, containment_score)
+
+
+_DISTINCT_CONTEXT_GROUPS = (
+    (
+        ('管理员',),
+        ('普通员工', '员工'),
+    ),
+    (
+        ('新增', '添加', '创建', '新建'),
+        ('编辑', '修改', '调整'),
+        ('停用', '禁用', '关闭'),
+        ('启用', '开启'),
+        ('取消', '撤销'),
+        ('查看', '查询', '浏览'),
+        ('筛选', '过滤'),
+        ('审核', '审批'),
+        ('删除',),
+    ),
+    (
+        ('待开始',),
+        ('进行中', '已开始'),
+        ('已结束',),
+        ('已取消',),
+        ('已停用',),
+    ),
+)
+
+
+def _marker_groups(text: str) -> list[set[int]]:
+    return [
+        {
+            index
+            for index, markers in enumerate(groups)
+            if any(marker in text for marker in markers)
+        }
+        for groups in _DISTINCT_CONTEXT_GROUPS
+    ]
+
+
+def _has_distinct_context(left: AnalysisItem, right: AnalysisItem) -> bool:
+    left_groups = _marker_groups(left.content)
+    right_groups = _marker_groups(right.content)
+    return any(
+        left_markers
+        and right_markers
+        and left_markers.isdisjoint(right_markers)
+        for left_markers, right_markers in zip(left_groups, right_groups)
+    )
+
+
+def _items_equivalent(
+    left: AnalysisItem,
+    right: AnalysisItem,
+    *,
+    same_source_is_duplicate: bool = False,
+) -> bool:
+    if _has_distinct_context(left, right):
+        return False
+    similarity = _semantic_similarity(left.content, right.content)
+    left_sources = _evidence_source_fragments(left.source_text)
+    right_sources = _evidence_source_fragments(right.source_text)
+    shared_source = bool(left_sources & right_sources)
+    if (
+        same_source_is_duplicate
+        and shared_source
+    ):
+        return (
+            _requirement_focus_similarity(
+                left.content,
+                right.content,
+            )
+            >= 0.13
+        )
+    if similarity >= 0.9:
+        return True
+
+    if shared_source:
+        return similarity >= 0.5
+
+    if (
+        left.source_section.strip()
+        and left.source_section.strip() == right.source_section.strip()
+        and similarity >= 0.82
+    ):
+        return True
+    return False
+
+
+def _item_completeness(item: AnalysisItem) -> float:
+    score = 0.0
+    if item.evidence_type == 'explicit':
+        score += 500.0
+    if item.source_text.strip():
+        score += 200.0
+    if item.source_section.strip():
+        score += 30.0
+    score += min(len(item.content.strip()), 500)
+    score += min(len(item.analysis.strip()), 500) * 0.5
+
+    risk_type = getattr(item, 'risk_type', '')
+    if isinstance(risk_type, str) and risk_type.strip():
+        score += 15.0
+    priority = getattr(item, 'priority', None)
+    score += {'P0': 12.0, 'P1': 6.0, 'P2': 0.0}.get(priority, 0.0)
+    return score
+
+
+def _dedupe_analysis_models(
+    items: list[AnalysisItem],
+    *,
+    same_source_is_duplicate: bool = False,
+) -> list[AnalysisItem]:
+    if len(items) < 2:
+        return items
+
+    parents = list(range(len(items)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left_index, left_item in enumerate(items):
+        for right_index in range(left_index + 1, len(items)):
+            if _items_equivalent(
+                left_item,
+                items[right_index],
+                same_source_is_duplicate=same_source_is_duplicate,
+            ):
+                union(left_index, right_index)
+
+    groups: dict[int, list[AnalysisItem]] = {}
+    for index, item in enumerate(items):
+        groups.setdefault(find(index), []).append(item)
+    return [
+        max(group, key=_item_completeness)
+        for group in groups.values()
+    ]
+
+
+def _priority_sort_key(item: RequirementItem) -> tuple[int, float]:
+    return (
+        {'P0': 0, 'P1': 1, 'P2': 2}.get(item.priority, 3),
+        -_item_completeness(item),
+    )
+
+
+def _dedupe_requirement_items(
+    items_by_field: Mapping[str, list[RequirementItem]],
+) -> dict[str, list[RequirementItem]]:
+    flattened: list[tuple[str, RequirementItem]] = []
+    for field_name in REQUIREMENT_LIST_FIELDS:
+        for item in items_by_field.get(field_name, []):
+            flattened.append((field_name, item))
+
+    if not flattened:
+        return {field_name: [] for field_name in REQUIREMENT_LIST_FIELDS}
+
+    parents = list(range(len(flattened)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left_index, (_, left_item) in enumerate(flattened):
+        for right_index in range(left_index + 1, len(flattened)):
+            if _items_equivalent(
+                left_item,
+                flattened[right_index][1],
+                same_source_is_duplicate=True,
+            ):
+                union(left_index, right_index)
+
+    field_rank = {
+        field_name: index
+        for index, field_name in enumerate(REQUIREMENT_LIST_FIELDS)
+    }
+    groups: dict[int, list[tuple[str, RequirementItem]]] = {}
+    for index, pair in enumerate(flattened):
+        groups.setdefault(find(index), []).append(pair)
+
+    result = {field_name: [] for field_name in REQUIREMENT_LIST_FIELDS}
+    for group in groups.values():
+        selected_field, selected_item = max(
+            group,
+            key=lambda pair: (
+                _item_completeness(pair[1]),
+                -field_rank[pair[0]],
+            ),
+        )
+        result[selected_field].append(selected_item)
+
+    for field_name in REQUIREMENT_LIST_FIELDS:
+        result[field_name].sort(key=_priority_sort_key)
+    return result
+
+
 def _split_document_sections(text: str) -> list[tuple[str, str]]:
     if not text.strip():
         return []
@@ -2513,12 +3208,48 @@ def _build_system_prompt(spec: _StageSpec) -> str:
         if field_contract
         else ''
     )
+    evidence_contract = ''
+    if spec.key != 'generation_1':
+        extra_fields = ''
+        if spec.key == 'generation_3':
+            extra_fields = ',\n      "risk_type": "并发"'
+        elif spec.key == 'generation_4':
+            extra_fields = ',\n      "priority": "P1"'
+        evidence_contract = f'''
+    分析条目统一结构：
+    {{
+      "content": "具体内容",
+      "evidence_type": "explicit 或 inferred",
+      "source_section": "PRD 来源章节；无法定位时为空字符串",
+      "source_text": "PRD 原文片段；无法定位时为空字符串",
+      "analysis": "分析说明"{extra_fields}
+    }}
+
+    证据与引用规则：
+    - explicit 表示 PRD 原文明确描述；必须提供逐字摘录的 source_text。
+    - inferred 表示根据 PRD 原文推断；analysis 必须以“推断依据：”说明推断依据。
+    - source_text 必须能在 PRD 中逐字找到，不得改写、概括、拼接或编造。
+    - source_section 必须使用 PRD 中的实际章节标题；无法确认时置为空字符串。
+    - 找不到原文依据时，把 source_section 和 source_text 置为空，并在 analysis 中说明原因。
+    - 无法给出任何原文依据的内容，不得标记为 explicit，也不得伪装成确定事实。
+    - 不允许把一般性建议、测试建议或推测写成产品需求。
+    ''' + (
+            '- potential_risks 的每一条都必须包含 risk_type，'
+            '不得省略；缺少该字段的 JSON 视为无效。\n'
+            if spec.key == 'generation_3'
+            else ''
+        ) + (
+            '- 四类需求问题的每一条都必须包含 priority，取值为 P0、P1 或 P2。\n'
+            if spec.key == 'generation_4'
+            else ''
+        )
     return f'''
     你是一名拥有10年以上经验的软件测试开发工程师。
 
     本次只执行一个独立分析阶段：{spec.label}。
     {spec.focus}
     {contract_block}
+    {evidence_contract}
 
     硬性要求：
     - 只能依据用户提供的原始文档进行分析。
@@ -2526,7 +3257,10 @@ def _build_system_prompt(spec: _StageSpec) -> str:
     - 只返回一个合法 JSON 对象，不要返回 Markdown 代码块。
     - JSON 必须且只能包含这些字段：{required_fields}。
     - 列表中的每一条应是独立、完整、可验证的结论，并标注所属模块。
-    - 合并同一根因、同一规则或同一确认点，禁止同义改写和近义重复。
+    - 合并语义相同、表达不同的条目，保留信息更完整、描述更准确的一条。
+    - 不得为了减少数量而合并触发条件、角色、状态或结果不同的实际业务规则。
+    - 同一根因或同一需求问题只能出现一次，禁止同义改写、近义重复和跨分类重复。
+    - 每个推断都必须在 analysis 中明确写出“推断依据：”，不得把推断伪装成明确需求。
     - 输出保持精炼，避免与当前阶段无关的重复内容。
     '''
 

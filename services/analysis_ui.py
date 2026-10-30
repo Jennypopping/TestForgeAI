@@ -9,8 +9,10 @@ import streamlit as st
 from services.ai_analyzer import (
     AIAnalysisTrace,
     AIStageTrace,
+    AnalysisItem,
     AnalysisEvent,
     ProductAnalysis,
+    RequirementItem,
 )
 
 STAGE_TITLES = {
@@ -19,7 +21,7 @@ STAGE_TITLES = {
     'generation_1': '阶段 1 · 产品概述与核心功能',
     'generation_2': '阶段 2 · 业务规则',
     'generation_3': '阶段 3 · 潜在风险',
-    'generation_4': '阶段 4 · 需求歧义与待确认问题',
+    'generation_4': '阶段 4 · 冲突、歧义、缺失与待确认问题',
     'request': 'DeepSeek API 请求',
     'response': '模型响应',
     'json_parse': 'JSON 解析',
@@ -67,6 +69,13 @@ def debug_panel_enabled() -> bool:
 def render_analysis_report(analysis: ProductAnalysis) -> None:
     st.divider()
     st.subheader('AI 产品分析报告')
+    st.download_button(
+        label='下载 AI 分析结果 JSON',
+        data=analysis.model_dump_json(indent=2),
+        file_name='product_analysis.json',
+        mime='application/json',
+        on_click='ignore',
+    )
 
     st.markdown('### 产品概述')
     st.write(analysis.product_summary)
@@ -76,31 +85,114 @@ def render_analysis_report(analysis: ProductAnalysis) -> None:
         st.write(f'- {item}')
 
     st.markdown(f'### 业务规则（{len(analysis.business_rules)} 条）')
-    for item in analysis.business_rules:
-        st.write(f'- {item}')
+    _render_analysis_items(
+        analysis.business_rules,
+        empty_text='未提取到有明确依据的业务规则。',
+    )
 
     st.markdown(f'### 潜在风险（{len(analysis.potential_risks)} 条）')
-    for item in analysis.potential_risks:
-        st.warning(item)
+    _render_analysis_items(
+        analysis.potential_risks,
+        empty_text='未发现可验证的潜在风险。',
+        show_risk_type=True,
+    )
 
     st.markdown(
-        f'### 需求歧义与待确认问题'
-        f'（{len(analysis.ambiguous_requirements)} 条）'
+        f'### 需求冲突（{len(analysis.requirement_conflicts)} 条）'
     )
-    for item in _sort_by_priority(analysis.ambiguous_requirements):
-        st.info(item)
+    _render_analysis_items(
+        analysis.requirement_conflicts,
+        empty_text='未发现 PRD 原文之间存在明确矛盾的描述。',
+        show_priority=True,
+    )
+
+    st.markdown(
+        f'### 需求歧义（{len(analysis.requirement_ambiguities)} 条）'
+    )
+    _render_analysis_items(
+        analysis.requirement_ambiguities,
+        empty_text='未发现存在多种实质理解的需求描述。',
+        show_priority=True,
+    )
+
+    st.markdown(
+        f'### 需求缺失（{len(analysis.missing_requirements)} 条）'
+    )
+    _render_analysis_items(
+        analysis.missing_requirements,
+        empty_text='未发现影响实现或测试的需求缺失。',
+        show_priority=True,
+    )
+
+    st.markdown(
+        f'### 待确认问题（{len(analysis.pending_questions)} 条）'
+    )
+    _render_analysis_items(
+        analysis.pending_questions,
+        empty_text='当前没有需要产品或业务人员进一步确认的问题。',
+        show_priority=True,
+    )
 
 
-def _sort_by_priority(items: list[str]) -> list[str]:
-    priority_re = re.compile(r'^\s*(?:\[)?(P[0-2])')
+def _render_analysis_items(
+    items: list[AnalysisItem],
+    *,
+    empty_text: str,
+    show_risk_type: bool = False,
+    show_priority: bool = False,
+) -> None:
+    if not items:
+        st.caption(empty_text)
+        return
 
-    def priority_key(item: str) -> tuple[int, int]:
-        match = priority_re.match(item)
-        if match is None:
-            return (3, 0)
-        return (int(match.group(1)[1]), 0)
+    for index, item in enumerate(items, start=1):
+        _render_analysis_item(
+            index,
+            item,
+            show_risk_type=show_risk_type,
+            show_priority=show_priority,
+        )
 
-    return sorted(items, key=priority_key)
+
+def _render_analysis_item(
+    index: int,
+    item: AnalysisItem,
+    *,
+    show_risk_type: bool,
+    show_priority: bool,
+) -> None:
+    st.markdown(f'**{index}. {item.content}**')
+
+    labels = [f'证据类型：`{item.evidence_type}`']
+    if show_risk_type:
+        risk_type = getattr(item, 'risk_type', '')
+        if risk_type:
+            labels.append(f'风险类型：`{risk_type}`')
+    if show_priority and isinstance(item, RequirementItem):
+        labels.append(f'优先级：`{item.priority}`')
+    labels.append(
+        f'来源章节：{item.source_section or "未定位"}'
+    )
+    st.caption(' · '.join(labels))
+
+    with st.expander('查看原文依据', expanded=False):
+        source_parts = [
+            part.strip()
+            for part in re.split(r'\s*(?:｜|\|\||\n+)\s*', item.source_text)
+            if part.strip()
+        ]
+        if source_parts:
+            for part in source_parts:
+                st.markdown(f'> {part}')
+        else:
+            st.caption(
+                'PRD 中未定位到可逐字引用的原文。'
+                '该项应结合 AI 分析说明和人工复核判断。'
+            )
+
+    with st.expander('查看 AI 分析说明', expanded=False):
+        st.write(item.analysis)
+    st.markdown('')
 
 
 def render_debug_panel(

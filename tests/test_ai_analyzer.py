@@ -12,10 +12,17 @@ from services.ai_analyzer import (
     AIOutputTruncatedError,
     AIValidationError,
     AIAnalyzer,
+    AnalysisItem,
+    PotentialRiskItem,
+    RequirementItem,
     STAGE_SPECS,
     _build_system_prompt,
     _build_subtasks,
+    _dedupe_analysis_models,
+    _dedupe_requirement_items,
     _dedupe_texts,
+    _ground_analysis_item,
+    _normalize_evidence_text,
 )
 
 
@@ -102,6 +109,44 @@ def _build_analyzer(
     return analyzer, completions
 
 
+def _business_rule(content, **overrides):
+    payload = {
+        'content': content,
+        'evidence_type': 'explicit',
+        'source_section': '3.2 创建预约',
+        'source_text': '预约需审核',
+        'analysis': 'PRD 明确要求该预约流程。',
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _risk(content, **overrides):
+    payload = {
+        'content': content,
+        'evidence_type': 'inferred',
+        'source_section': '3.2 创建预约',
+        'source_text': '预约需审核',
+        'analysis': '推断依据：审核状态变化会产生并发处理需求。',
+        'risk_type': '并发',
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _requirement(content, priority='P1', **overrides):
+    payload = {
+        'content': content,
+        'evidence_type': 'explicit',
+        'source_section': '6 待确认问题',
+        'source_text': '通知方式待确认',
+        'analysis': 'PRD 明确将通知方式列为待确认事项。',
+        'priority': priority,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _stage_payloads():
     return [
         {
@@ -109,13 +154,30 @@ def _stage_payloads():
             'core_features': ['访客预约', '访客审核'],
         },
         {
-            'business_rules': ['预约需审核', '黑名单人员禁止签到'],
+            'business_rules': [
+                _business_rule('[审核][状态流转] 预约需审核 → pending'),
+                _business_rule(
+                    '[签到][权限] 黑名单人员禁止签到',
+                    source_text='黑名单人员禁止签到',
+                ),
+            ],
         },
         {
-            'potential_risks': ['并发审核冲突', '重复签到'],
+            'potential_risks': [
+                _risk('[审核][并发] 并发审核冲突 → 状态覆盖'),
+                _risk(
+                    '[签到][数据一致性] 重复签到 → 记录重复',
+                    risk_type='数据一致性',
+                ),
+            ],
         },
         {
-            'ambiguous_requirements': ['通知方式待确认'],
+            'requirement_conflicts': [],
+            'requirement_ambiguities': [],
+            'missing_requirements': [],
+            'pending_questions': [
+                _requirement('[通知] 通知方式待确认；需确认：使用何种通知方式'),
+            ],
         },
     ]
 
@@ -140,6 +202,7 @@ def _successful_outcomes(payloads=None):
         _build_response(stage4_json, response_id='resp_stage_4a'),
         _build_response(stage4_json, response_id='resp_stage_4b'),
         _build_response(stage4_json, response_id='resp_stage_4c'),
+        _build_response(stage4_json, response_id='resp_stage_4d'),
     ]
 
 
@@ -164,52 +227,78 @@ class AIAnalyzerTests(unittest.TestCase):
         expected_fragments = {
             'generation_2': '[模块][规则类型]',
             'generation_3': '[模块][风险类型]',
-            'generation_4': '[P0|P1|P2][模块][歧义|冲突|缺失]',
+            'generation_4': 'requirement_conflicts',
         }
 
         for stage_key, fragment in expected_fragments.items():
             prompt = _build_system_prompt(specs[stage_key])
             self.assertIn('输出契约', prompt)
             self.assertIn(fragment, prompt)
-            self.assertIn('合并同一根因', prompt)
+            self.assertIn('合并语义相同', prompt)
+            self.assertIn('推断依据', prompt)
+        self.assertIn(
+            '并列动词',
+            _build_system_prompt(specs['generation_2']),
+        )
 
     def test_merge_normalizes_and_deduplicates_analysis_items(self):
         analyzer, _ = _build_analyzer([])
         payloads = _stage_payloads()
         payloads[1] = {
             'business_rules': [
-                '  1. [审核][状态流转] 开启 → pending  ',
-                '- [审核][状态流转] 开启 → pending',
-                '[审核][状态流转] 关闭 → scheduled',
+                _business_rule(
+                    '[审核][状态流转] 开启 → pending',
+                    analysis='开启审核后进入 pending。',
+                ),
+                _business_rule(
+                    '[审核][状态流转] 开启审核 → 预约进入 pending',
+                    analysis='开启审核后进入 pending 状态，需被访人审核。',
+                ),
+                _business_rule(
+                    '[审核][状态流转] 关闭 → scheduled',
+                    source_text='关闭时自动通过',
+                ),
             ],
         }
         payloads[2] = {
             'potential_risks': [
-                '- [审核][状态流转] 开启 → pending',
-                '  2、 [审核][权限安全] 越权审核 → 数据泄露  ',
+                _risk(
+                    '[审核][状态流转] 开启 → pending',
+                    risk_type='状态流转',
+                ),
+                _risk(
+                    '[审核][权限安全] 越权审核 → 数据泄露',
+                    risk_type='权限安全',
+                ),
             ],
+        }
+        payloads[3] = {
+            'requirement_conflicts': [],
+            'requirement_ambiguities': [],
+            'missing_requirements': [],
+            'pending_questions': [],
         }
         stage_payloads = {
             'generation_1': payloads[0],
             'generation_2': payloads[1],
             'generation_3': payloads[2],
-            'generation_4': {'ambiguous_requirements': []},
+            'generation_4': payloads[3],
         }
         trace = AIAnalysisTrace(model='deepseek-flash')
 
         analysis = analyzer._merge_stage_results(stage_payloads, trace)
 
+        self.assertEqual(len(analysis.business_rules), 2)
         self.assertEqual(
-            analysis.business_rules,
-            [
-                '[审核][状态流转] 开启 → pending',
-                '[审核][状态流转] 关闭 → scheduled',
-            ],
+            analysis.business_rules[0].content,
+            '[审核][状态流转] 开启审核 → 预约进入 pending',
         )
+        self.assertIn('被访人审核', analysis.business_rules[0].analysis)
         self.assertEqual(
-            analysis.potential_risks,
-            ['[审核][权限安全] 越权审核 → 数据泄露'],
+            analysis.business_rules[1].content,
+            '[审核][状态流转] 关闭 → scheduled',
         )
+        self.assertEqual(len(analysis.potential_risks), 2)
 
     def test_dedupe_texts_strips_list_markers_and_whitespace(self):
         self.assertEqual(
@@ -221,6 +310,252 @@ class AIAnalyzerTests(unittest.TestCase):
             ['[A] 第一条', '[B] 第二条'],
         )
 
+    def test_evidence_schema_requires_source_or_inference_basis(self):
+        with self.assertRaises(ValueError):
+            AnalysisItem(
+                content='规则',
+                evidence_type='explicit',
+                source_text='',
+                analysis='明确规则',
+            )
+        with self.assertRaises(ValueError):
+            AnalysisItem(
+                content='风险',
+                evidence_type='inferred',
+                source_text='原文',
+                analysis='没有说明依据',
+            )
+
+    def test_fake_explicit_citation_is_downgraded(self):
+        item = AnalysisItem(
+            content='[预约] 预约时间不能重叠',
+            evidence_type='explicit',
+            source_section='3.2 创建预约',
+            source_text='PRD 中不存在这句话',
+            analysis='原文明确说明不能重叠。',
+        )
+        grounded = _ground_analysis_item(
+            item,
+            _normalize_evidence_text(
+                '同一会议室的预约时间不能重叠。'
+            ),
+        )
+
+        self.assertEqual(grounded.evidence_type, 'inferred')
+        self.assertEqual(grounded.source_text, '')
+        self.assertIn('推断依据', grounded.analysis)
+
+    def test_grounding_uses_actual_prd_section_titles(self):
+        document = (
+            '# 产品需求文档\n\n'
+            '## 3.2 创建预约\n\n'
+            '- 同一会议室的预约时间不能重叠。\n\n'
+            '## 6. 待确认问题\n\n'
+            '- Q1：预约时间是否允许精确到分钟？\n'
+        )
+        item = AnalysisItem(
+            content='[创建预约][校验] 预约时间不能重叠。',
+            evidence_type='explicit',
+            source_section='3.2 会议室预约（模型自拟标题）',
+            source_text='同一会议室的预约时间不能重叠。',
+            analysis='原文明确要求预约时间不能重叠。',
+        )
+
+        grounded = _ground_analysis_item(
+            item,
+            _normalize_evidence_text(document),
+            document,
+        )
+
+        self.assertEqual(grounded.source_section, '3.2 创建预约')
+
+    def test_grounding_keeps_all_sections_for_composite_evidence(self):
+        document = (
+            '# 产品需求文档\n\n'
+            '## 3.5 会议室管理\n\n'
+            '- 停用会议室前需要检查是否存在未结束的预约。\n\n'
+            '## 6. 待确认问题\n\n'
+            '- Q4：管理员停用存在未来预约的会议室时，是否需要自动取消这些预约？\n'
+        )
+        item = AnalysisItem(
+            content='[会议室管理] 停用会议室时未来预约的处理方式未定。',
+            evidence_type='explicit',
+            source_section='3.5',
+            source_text=(
+                '停用会议室前需要检查是否存在未结束的预约。｜'
+                'Q4：管理员停用存在未来预约的会议室时，是否需要自动取消这些预约？'
+            ),
+            analysis='两段原文共同说明停用流程存在待确认规则。',
+        )
+
+        grounded = _ground_analysis_item(
+            item,
+            _normalize_evidence_text(document),
+            document,
+        )
+
+        self.assertEqual(
+            grounded.source_section,
+            '3.5 会议室管理；6. 待确认问题',
+        )
+
+    def test_semantic_dedupe_keeps_more_complete_item(self):
+        shorter = AnalysisItem(
+            content='[审核] 开启审核后预约进入待审核状态',
+            evidence_type='explicit',
+            source_section='3.2',
+            source_text='开启审核后进入待审核状态',
+            analysis='原文规定了状态。',
+        )
+        complete = AnalysisItem(
+            content='[审核] 开启审核后预约进入 pending，关闭后自动通过',
+            evidence_type='explicit',
+            source_section='3.2 创建预约',
+            source_text='开启审核后进入待审核状态',
+            analysis='原文明确说明开启与关闭审核时的状态流转。',
+        )
+
+        merged = _dedupe_analysis_models([shorter, complete])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].content, complete.content)
+        self.assertEqual(merged[0].analysis, complete.analysis)
+
+    def test_requirement_categories_are_mutually_exclusive(self):
+        conflict_item = RequirementItem(
+            content='[预约] 同一会议室的预约是否允许重叠',
+            evidence_type='explicit',
+            source_section='3.2 创建预约',
+            source_text='同一会议室的预约时间不能重叠',
+            analysis='该问题同时出现在冲突与歧义列表中。',
+            priority='P0',
+        )
+        ambiguity_item = RequirementItem(
+            content='[预约] 同一会议室预约时间能否重叠',
+            evidence_type='explicit',
+            source_section='3.2 创建预约',
+            source_text='同一会议室的预约时间不能重叠',
+            analysis='应归入最合适的唯一分类。',
+            priority='P1',
+        )
+
+        merged = _dedupe_requirement_items({
+            'requirement_conflicts': [conflict_item],
+            'requirement_ambiguities': [ambiguity_item],
+            'missing_requirements': [],
+            'pending_questions': [],
+        })
+
+        total = sum(len(items) for items in merged.values())
+        self.assertEqual(total, 1)
+        self.assertEqual(len(merged['requirement_conflicts']), 1)
+
+    def test_requirement_same_source_rewording_is_merged(self):
+        first = RequirementItem(
+            content='[创建预约] Q1 未确认预约时间精度，需确认精确到分钟还是整点/半点。',
+            evidence_type='explicit',
+            source_section='6 待确认问题',
+            source_text='Q1：预约时间是否允许精确到分钟，还是只能选择整点或半点？',
+            analysis='PRD 已明确列为待确认问题。',
+            priority='P1',
+        )
+        second = RequirementItem(
+            content='预约时间是否允许精确到分钟，还是只能选择整点或半点？需确认时间粒度。',
+            evidence_type='explicit',
+            source_section='6 待确认问题',
+            source_text='Q1：预约时间是否允许精确到分钟，还是只能选择整点或半点？',
+            analysis='PRD 已明确列为待确认问题，影响重叠判断。',
+            priority='P1',
+        )
+
+        merged = _dedupe_requirement_items({
+            'requirement_conflicts': [],
+            'requirement_ambiguities': [],
+            'missing_requirements': [],
+            'pending_questions': [first, second],
+        })
+
+        self.assertEqual(len(merged['pending_questions']), 1)
+
+    def test_requirement_same_source_distinct_focus_is_kept(self):
+        name_scope = RequirementItem(
+            content=(
+                '“会议室名称不能重复”是否包含已停用会议室存在两种解释：'
+                '全局唯一（含停用）或仅启用会议室唯一（停用后可复用名称）；'
+                '需确认：停用会议室是否占用名称唯一性。'
+            ),
+            evidence_type='explicit',
+            source_section='3.5 会议室管理',
+            source_text='会议室名称不能重复。',
+            analysis='需要确认停用会议室是否占用名称。',
+            priority='P1',
+        )
+        edit_self = RequirementItem(
+            content=(
+                '编辑会议室时名称唯一性校验是否排除当前会议室自身未定义；'
+                '需确认：仅修改其他信息而保留原名称是否允许保存。'
+            ),
+            evidence_type='inferred',
+            source_section='3.5 会议室管理',
+            source_text='会议室名称不能重复。',
+            analysis='推断依据：编辑场景通常需要排除当前记录自身。',
+            priority='P2',
+        )
+
+        merged = _dedupe_requirement_items({
+            'requirement_conflicts': [],
+            'requirement_ambiguities': [name_scope],
+            'missing_requirements': [edit_self],
+            'pending_questions': [],
+        })
+
+        total = sum(len(items) for items in merged.values())
+        self.assertEqual(total, 2)
+
+    def test_dedupe_keeps_distinct_roles_actions_and_states(self):
+        source_text = '管理员可以新增、编辑和停用会议室。'
+        items = [
+            AnalysisItem(
+                content='[会议室管理][权限] 管理员新增会议室 → 允许新增。',
+                evidence_type='explicit',
+                source_section='3.5 会议室管理',
+                source_text=source_text,
+                analysis='原文明确允许新增。',
+            ),
+            AnalysisItem(
+                content='[会议室管理][权限] 管理员编辑会议室 → 允许编辑。',
+                evidence_type='explicit',
+                source_section='3.5 会议室管理',
+                source_text=source_text,
+                analysis='原文明确允许编辑。',
+            ),
+            AnalysisItem(
+                content='[会议室管理][权限] 管理员停用会议室 → 允许停用。',
+                evidence_type='explicit',
+                source_section='3.5 会议室管理',
+                source_text=source_text,
+                analysis='原文明确允许停用。',
+            ),
+            AnalysisItem(
+                content='[取消预约][权限] 员工取消预约 → 仅可取消自己的预约。',
+                evidence_type='explicit',
+                source_section='3.3 取消预约',
+                source_text='员工可以取消自己创建的预约。',
+                analysis='原文明确员工取消权限。',
+            ),
+            AnalysisItem(
+                content='[取消预约][权限] 管理员取消预约 → 可取消任意预约。',
+                evidence_type='explicit',
+                source_section='3.3 取消预约',
+                source_text='管理员可以取消任意预约。',
+                analysis='原文明确管理员取消权限。',
+            ),
+        ]
+
+        deduped = _dedupe_analysis_models(items)
+
+        self.assertEqual(len(deduped), 5)
+
     def test_staged_generation_merges_all_fields(self):
         analyzer, completions = _build_analyzer(
             _successful_outcomes()
@@ -231,17 +566,25 @@ class AIAnalyzerTests(unittest.TestCase):
 
         self.assertEqual(analysis.product_summary, '访客管理系统')
         self.assertEqual(analysis.core_features[0], '访客预约')
-        self.assertEqual(analysis.business_rules[0], '预约需审核')
-        self.assertEqual(analysis.potential_risks[0], '并发审核冲突')
         self.assertEqual(
-            analysis.ambiguous_requirements[0],
-            '通知方式待确认',
+            analysis.business_rules[0].content,
+            '[审核][状态流转] 预约需审核 → pending',
         )
-        self.assertEqual(len(completions.requests), 6)
+        self.assertEqual(
+            analysis.potential_risks[0].content,
+            '[审核][并发] 并发审核冲突 → 状态覆盖',
+        )
+        self.assertEqual(len(analysis.pending_questions), 1)
+        self.assertIn(
+            '通知方式待确认',
+            analysis.pending_questions[0].content,
+        )
+        self.assertEqual(len(completions.requests), 7)
         expected_budgets = [
             analyzer.stage_output_budgets['generation_1'],
             analyzer.stage_output_budgets['generation_2'],
             analyzer.stage_output_budgets['generation_3'],
+            analyzer.stage_output_budgets['generation_4'],
             analyzer.stage_output_budgets['generation_4'],
             analyzer.stage_output_budgets['generation_4'],
             analyzer.stage_output_budgets['generation_4'],
@@ -250,7 +593,7 @@ class AIAnalyzerTests(unittest.TestCase):
             [request['max_tokens'] for request in completions.requests],
             expected_budgets,
         )
-        self.assertEqual(analyzer.last_trace.usage['total_tokens'], 720)
+        self.assertEqual(analyzer.last_trace.usage['total_tokens'], 840)
         self.assertEqual(
             len(analyzer.last_trace.stage_traces),
             4,
@@ -371,7 +714,7 @@ class AIAnalyzerTests(unittest.TestCase):
         analysis = analyzer.analyze('产品文档')
 
         self.assertEqual(analysis.product_summary, '访客管理系统')
-        self.assertEqual(len(completions.requests), 7)
+        self.assertEqual(len(completions.requests), 8)
         self.assertIn(
             '缩小单次输出范围',
             completions.requests[1]['messages'][0]['content'],
@@ -433,7 +776,7 @@ class AIAnalyzerTests(unittest.TestCase):
             analysis.core_features,
             ['访客预约', '访客审核'],
         )
-        self.assertEqual(len(completions.requests), 9)
+        self.assertEqual(len(completions.requests), 10)
         self.assertNotEqual(
             completions.requests[2]['messages'][1]['content'],
             completions.requests[3]['messages'][1]['content'],
@@ -447,7 +790,7 @@ class AIAnalyzerTests(unittest.TestCase):
         analysis = analyzer.analyze('产品文档')
 
         self.assertEqual(analysis.product_summary, '访客管理系统')
-        self.assertEqual(len(completions.requests), 7)
+        self.assertEqual(len(completions.requests), 8)
         self.assertLess(
             completions.requests[1]['max_tokens'],
             completions.requests[0]['max_tokens'],
@@ -481,7 +824,7 @@ class AIAnalyzerTests(unittest.TestCase):
             document_content='产品文档',
         )
 
-        self.assertEqual(len(subtasks), 7)
+        self.assertEqual(len(subtasks), 9)
         self.assertEqual(len(subtasks[0].modules), 4)
         self.assertIn('_modules1', subtasks[0].key)
         self.assertIn('_modules2', subtasks[-2].key)
@@ -490,7 +833,7 @@ class AIAnalyzerTests(unittest.TestCase):
             'generation_4_cross_module',
         )
 
-    def test_stage4_keeps_three_subtasks_for_small_feature_sets(self):
+    def test_stage4_keeps_four_subtasks_for_small_feature_sets(self):
         spec = next(
             item for item in STAGE_SPECS
             if item.key == 'generation_4'
@@ -505,7 +848,7 @@ class AIAnalyzerTests(unittest.TestCase):
             document_content='产品文档',
         )
 
-        self.assertEqual(len(subtasks), 3)
+        self.assertEqual(len(subtasks), 4)
         self.assertEqual(
             subtasks[0].modules,
             ('访客预约', '访客审核'),
@@ -592,7 +935,7 @@ class AIAnalyzerTests(unittest.TestCase):
         analysis = analyzer.analyze('产品文档')
 
         self.assertEqual(analysis.product_summary, '访客管理系统')
-        self.assertEqual(len(completions.requests), 7)
+        self.assertEqual(len(completions.requests), 8)
         self.assertEqual(
             analyzer.last_trace.stage_traces[0].attempts,
             2,

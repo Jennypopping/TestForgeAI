@@ -190,13 +190,6 @@ if uploaded_file:
 
     analysis = st.session_state.get(ANALYSIS_RESULT_STATE_KEY)
     if analysis is not None:
-        st.download_button(
-            label='下载 AI 分析结果 JSON',
-            data=analysis.model_dump_json(indent=2),
-            file_name='product_analysis.json',
-            mime='application/json',
-            on_click='ignore',
-        )
         render_analysis_report(analysis)
         render_debug_panel(
             st.session_state.get(ANALYSIS_TRACE_STATE_KEY)
