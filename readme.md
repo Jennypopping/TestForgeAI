@@ -227,6 +227,36 @@ TESTFORGE_DB_PATH=data/testforge.db
 `.gitignore` 会忽略 `data/*`，但保留可提交的 `data/.gitkeep`，因此不会把
 `data/testforge.db` 或本地历史报告提交到 GitHub。
 
+### AI 测试用例生成、审核与导出
+
+需求分析报告生成并保存后，可从侧边栏进入“测试用例管理”，也可以在
+“报告详情”或新建分析完成页点击“测试用例管理”入口。
+
+- 生成数据源仅使用 `core_features`、`business_rules`、`potential_risks`。
+  `requirement_conflicts`、`requirement_ambiguities`、
+  `missing_requirements`、`pending_questions` 保留在分析报告中，不参与用例生成。
+- 核心功能使用 `CF-001` 等稳定需求 ID，业务规则使用 `BR-001`，
+  潜在风险使用 `PR-001`。每条用例必须关联 `requirement_id`。
+- 核心功能和业务规则用例必须包含明确需求依据与预期结果；潜在风险用例
+  自动标记为 AI 推断。风险没有明确预期行为时，预期结果保持为空并标记为
+  “待人工审核”，不会编造结果。
+- 页面按模块展示用例，支持按模块、优先级、测试类型、来源类型筛选；
+  可查看前置条件、测试数据、步骤、预期结果、需求原文与生成依据。
+- 用例可直接编辑保存；删除单条用例或整份用例集均需二次确认。
+- 生成的完整 `TestCaseCollection` JSON 保存到 SQLite 的
+  `test_case_collections` 表。JSON 是唯一业务数据源，页面展示、人工编辑、
+  JSON 导出和 XMind 导出都读取同一份集合数据。
+- 历史测试用例集可重新打开；重新生成会保存为新版本，可在历史列表中切换。
+- JSON 支持导出全部用例、当前筛选结果和完整原始数据，均与最终保存版本一致。
+- XMind 使用 Python 标准库生成 XMind 8 兼容的 ZIP 包
+  （`content.xml`、`styles.xml`、`meta.xml`、`META-INF/manifest.xml`），
+  不依赖额外 XMind 库。层级为“产品名称 → 功能模块 →（测试点）→ 测试用例
+  → 用例字段”，支持全部用例和按模块导出，文件名包含产品名称与日期。
+
+数据库 schema 已升级到 v2；启动时自动进行非破坏性迁移。已有
+`analysis_reports` 数据不会重建或清空。删除分析报告时，其关联测试用例集会
+通过外键级联删除。
+
 ### 运行测试
 
 ```powershell

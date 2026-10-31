@@ -42,6 +42,10 @@ pages = [
         title='报告管理',
     ),
     st.Page(
+        'views/test_case_management.py',
+        title='测试用例管理',
+    ),
+    st.Page(
         'views/report_detail.py',
         title='报告详情',
     ),

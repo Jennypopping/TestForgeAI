@@ -288,6 +288,10 @@ class AnalysisItem(BaseModel):
         default='',
         description='关联的其他需求问题 ID，例如 A1、M1',
     )
+    test_point_id: str = Field(
+        default='',
+        description='已有测试点稳定 ID；没有现成测试点时为空',
+    )
 
     @model_validator(mode='after')
     def validate_evidence_contract(self) -> 'AnalysisItem':
