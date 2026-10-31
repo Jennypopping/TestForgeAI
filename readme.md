@@ -4,7 +4,17 @@
 
 - Python 3.9+（当前验证版本：3.9.13）
 - SQLite 由 Python 标准库自带，无需单独安装数据库服务
-- 可访问 DeepSeek API 的网络
+- 可访问所选 LLM 服务商 API 的网络
+
+### 新用户五步启动
+
+1. **Clone 项目**：`git clone https://github.com/Jennypopping/TestForgeAI.git`，然后进入项目目录。
+2. **安装依赖**：`python -m pip install -r requirements.txt`。
+3. **复制配置模板**：Windows 使用 `Copy-Item .env.example .env`，Linux / macOS 使用 `cp .env.example .env`。
+4. **填写自己的模型配置**：编辑 `.env`，至少设置 `LLM_PROVIDER`、`LLM_API_KEY`、`LLM_BASE_URL` 和 `LLM_MODEL`。
+5. **启动项目**：运行 `streamlit run app.py`，然后访问 http://localhost:8501。
+
+整个流程不需要修改 Python 源代码。API Key 只保存在本机 `.env` 中，不得写入代码、SQLite 或提交到 GitHub。
 
 ### 从 GitHub 克隆并启动（Windows PowerShell）
 
@@ -16,7 +26,7 @@ python -m venv .venv
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 Copy-Item .env.example .env
-# 编辑 .env，填入自己的 DEEPSEEK_API_KEY
+# 编辑 .env，选择服务商并填入 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
 streamlit run app.py
 ```
 
@@ -32,12 +42,161 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
-# 编辑 .env，填入自己的 DEEPSEEK_API_KEY
+# 编辑 .env，选择服务商并填入 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
 streamlit run app.py
 ```
 
-`DEEPSEEK_API_KEY` 只保存在本地 `.env` 中；`.env` 已被 `.gitignore`
+`LLM_API_KEY` 只保存在本地 `.env` 中；`.env` 已被 `.gitignore`
 排除，不会被提交到 GitHub。可从 `.env.example` 查看所有可配置项。
+
+### 配置自己的模型服务
+
+项目通过 OpenAI 兼容接口支持 DeepSeek、OpenAI、通义千问（阿里云百炼）、
+硅基流动，以及任意其他兼容 OpenAI API 的服务商。只需修改 `.env`，无需修改
+Python 源代码：
+
+```env
+LLM_PROVIDER=deepseek
+LLM_API_KEY=your_api_key
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+LLM_TIMEOUT=120
+```
+
+| `LLM_PROVIDER` | 服务商 | 预设 Base URL |
+|----------------|--------|---------------|
+| `deepseek` | DeepSeek | `https://api.deepseek.com` |
+| `openai` | OpenAI | `https://api.openai.com/v1` |
+| `qwen` | 通义千问（阿里云百炼） | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `siliconflow` | 硅基流动 | `https://api.siliconflow.cn/v1` |
+| `custom` | 其他 OpenAI 兼容服务 | 必须通过 `LLM_BASE_URL` 填写 |
+
+`LLM_BASE_URL` 和 `LLM_MODEL` 始终优先于服务商预设，因此可以连接自建网关、
+代理或兼容 OpenAI API 的本地模型服务。`LLM_TIMEOUT` 单位为秒。
+
+所有模型请求统一由 `services/llm_client.py` 中的 `LLMClient` 基于 OpenAI
+Python SDK 执行；各服务商通过不同的 `base_url` 适配。业务层不直接调用服务商
+SDK，也不会直接拼接各服务商的 API 地址。
+
+### 各服务商配置示例
+
+以下示例都只需要修改 `.env`。模型名称、可用模型和账户权限以服务商控制台为准。
+
+#### DeepSeek
+
+```env
+LLM_PROVIDER=deepseek
+LLM_API_KEY=your_deepseek_api_key
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+LLM_TIMEOUT=120
+```
+
+- API Key 获取：https://platform.deepseek.com/api_keys
+- 代码和 JSON 输出任务建议使用 `deepseek-chat`；`deepseek-reasoner` 也可运行，但会自动关闭不兼容的 JSON Mode。
+- 旧版 `DEEPSEEK_API_KEY` 可继续使用，详见下方兼容说明。
+
+#### OpenAI
+
+```env
+LLM_PROVIDER=openai
+LLM_API_KEY=your_openai_api_key
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+LLM_TIMEOUT=120
+```
+
+- API Key 获取：https://platform.openai.com/api-keys
+- 请确认账户有对应模型权限和可用额度；使用代理或中转服务时，将 `LLM_BASE_URL` 改为其 OpenAI 兼容根地址。
+- `o` 系列和 `gpt-5` 系列会自动改用 `max_completion_tokens`，并移除不支持的 `temperature` 与 JSON Mode 参数。
+
+#### 通义千问（阿里云百炼）
+
+```env
+LLM_PROVIDER=qwen
+LLM_API_KEY=your_dashscope_api_key
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL=qwen-plus
+LLM_TIMEOUT=120
+```
+
+- API Key 获取：https://bailian.console.aliyun.com/
+- 请使用百炼的 OpenAI 兼容模式地址，并在控制台确认模型名称和地域权限。
+- 不同 Qwen 模型对 JSON Mode 和思考参数的支持不同；服务端拒绝时客户端会移除对应参数后重试。
+
+#### 硅基流动
+
+```env
+LLM_PROVIDER=siliconflow
+LLM_API_KEY=your_siliconflow_api_key
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_MODEL=Qwen/Qwen3-8B
+LLM_TIMEOUT=120
+```
+
+- API Key 获取：https://cloud.siliconflow.cn/account/ak
+- `LLM_MODEL` 必须填写控制台中完整的模型 ID，大小写和斜杠都要保持一致。
+- 模型广场中不同模型的上下文、输出上限和 JSON 支持情况可能不同。
+
+#### Custom（Ollama、vLLM、自建网关等）
+
+```env
+LLM_PROVIDER=custom
+LLM_API_KEY=local
+LLM_BASE_URL=http://localhost:8000/v1
+LLM_MODEL=your-model-name
+LLM_TIMEOUT=120
+```
+
+- 适用于任何实现 OpenAI Chat Completions 兼容接口的服务，例如 vLLM、Ollama、One API、LiteLLM 或自建代理。
+- `LLM_BASE_URL` 应填写兼容根地址，通常以 `/v1` 结尾，不要再拼接 `/chat/completions`。
+- Ollama 的 OpenAI 兼容地址通常是 `http://localhost:11434/v1`，模型名填写已拉取的模型，例如 `qwen2.5:7b`。
+- 本地服务不校验 Key 时，`LLM_API_KEY` 仍需填写一个非空占位值，例如 `local`。
+- Custom 默认不发送 JSON Mode；确认服务支持后可设置 `LLM_JSON_MODE=true`，否则由 Prompt 和后续 JSON 校验保证输出结构。
+
+旧版配置继续兼容：在 `LLM_PROVIDER=deepseek`（或未设置、使用默认
+DeepSeek）时，如果未设置 `LLM_API_KEY`，程序会回退读取
+`DEEPSEEK_API_KEY`；`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` 和
+`DEEPSEEK_TIMEOUT_SECONDS` 也仍是旧版别名。`LLM_*` 变量始终优先。
+切换到 OpenAI、通义千问、硅基流动或 Custom 后，不会混用旧 DeepSeek
+地址、模型或 Key，避免请求发往错误服务商。
+
+#### 参数兼容与自动回退
+
+不同服务商和模型对 JSON Mode、Token 参数及思考参数的支持并不一致。
+`LLMClient` 会先根据服务商和模型名选择保守参数，并在服务端返回
+400 / 422 且明确拒绝某个参数时自动调整一次：
+
+- `response_format` 不受支持时移除 JSON Mode，继续依赖现有 Prompt 返回 JSON。
+- `temperature` 不受支持时移除该参数。
+- `max_tokens` 与 `max_completion_tokens` 不受支持时自动切换。
+- `reasoning_effort` 不受支持时移除该参数。
+
+可通过 `.env` 显式覆盖自动判断：
+
+```env
+LLM_JSON_MODE=auto
+LLM_TOKEN_PARAMETER=auto
+LLM_REASONING_EFFORT=
+```
+
+- `LLM_JSON_MODE`：`auto` / `true` / `false`。Custom 默认是 `false`。
+- `LLM_TOKEN_PARAMETER`：`auto` / `max_tokens` / `max_completion_tokens`。
+- `LLM_REASONING_EFFORT`：留空表示不发送；可选 `none`、`minimal`、`low`、`medium`、`high`。
+- 自动判断仍无法解决时，错误信息会包含 provider、model、状态码，并提示检查上述兼容参数。
+
+现有超时、请求重试、Token Usage 统计、`finish_reason=length` 截断识别、
+JSON 截断恢复和分阶段重试能力保持不变。
+
+#### 接口能力边界
+
+- 仅支持 OpenAI Chat Completions 兼容接口，不接入各厂商私有 SDK、OpenAI Responses API 或 Anthropic Messages API。
+- 不会盲目发送 DeepSeek 专属参数；通用请求参数之外，仅发送显式配置的 `reasoning_effort`。
+- 不自动翻译厂商私有思考开关。例如 DashScope 的 `enable_thinking`、Anthropic 的 `thinking` 等需由服务商兼容层自行处理。
+- 当前分析流程只使用文本对话和 JSON 输出；不支持视觉、音频、Embedding、函数调用、工具调用或流式输出。
+- 不支持 JSON Mode 的模型仍可运行，但完全依赖 Prompt 返回合法 JSON；失败时使用现有校验、修复提示和截断恢复机制。
+- 未知模型使用保守的 8192 输出 Token 上限；已有超长文档拆分与 JSON 截断恢复。
+- Custom 服务必须实现 `/chat/completions`，并返回标准 `choices[0].message.content`；Token 统计缺失时会显示为不可用，不影响报告生成。
 
 ### 首次启动与数据库说明
 
@@ -74,6 +233,8 @@ TESTFORGE_DB_PATH=data/testforge.db
 pip install -r requirements-dev.txt
 python -m pytest -q
 ```
+
+测试使用 Mock / Fake LLM 客户端和本地临时 SQLite，不会调用真实模型 API，也不会消耗 API 额度。
 
 ## 开发问题与解决记录
 
@@ -142,13 +303,19 @@ DeepSeek 默认思考模式下，reasoning_tokens 与 JSON 输出共享
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DEEPSEEK_MAX_OUTPUT_TOKENS` | 32768 | 全局输出预算上限 |
-| `DEEPSEEK_GENERATION_1_MAX_TOKENS` | 10240 | 阶段 1 预算（显式设置后为硬上限） |
-| `DEEPSEEK_GENERATION_2_MAX_TOKENS` | 14336 | 阶段 2 预算（同上） |
-| `DEEPSEEK_GENERATION_3_MAX_TOKENS` | 14336 | 阶段 3 预算（同上） |
-| `DEEPSEEK_GENERATION_4_MAX_TOKENS` | 20480 | 阶段 4 预算（同上） |
-| `DEEPSEEK_MAX_VALIDATION_RETRIES` | 1 | JSON / 校验失败修复重试次数 |
-| `DEEPSEEK_MAX_TRUNCATION_RECOVERIES` | 2 | 截断拆分恢复层数 |
+| `LLM_MAX_OUTPUT_TOKENS` | 32768 | 全局输出预算上限 |
+| `LLM_GENERATION_1_MAX_TOKENS` | 10240 | 阶段 1 预算（显式设置后为硬上限） |
+| `LLM_GENERATION_2_MAX_TOKENS` | 14336 | 阶段 2 预算（同上） |
+| `LLM_GENERATION_3_MAX_TOKENS` | 14336 | 阶段 3 预算（同上） |
+| `LLM_GENERATION_4_MAX_TOKENS` | 20480 | 阶段 4 预算（同上） |
+| `LLM_MAX_RETRIES` | 2 | 请求重试次数 |
+| `LLM_RETRY_BACKOFF_SECONDS` | 1.0 | 重试间隔 |
+| `LLM_MAX_VALIDATION_RETRIES` | 1 | JSON / 校验失败修复重试次数 |
+| `LLM_MAX_TRUNCATION_RECOVERIES` | 2 | 截断拆分恢复层数 |
+
+旧版 `DEEPSEEK_MAX_OUTPUT_TOKENS`、`DEEPSEEK_GENERATION_*_MAX_TOKENS`
+等调优变量仍作为兼容别名读取，但 `LLM_*` 优先。业务模块不包含服务商或
+模型专属配置，相关解析与模型能力信息统一由 `services/llm_client.py` 管理。
 
 ## 4、AI 需求分析质量优化
 
@@ -225,7 +392,7 @@ $env:TESTFORGE_DB_PATH = 'D:\data\testforge.db'
 
 Streamlit 导航包含以下页面：
 
-- **新建分析**：上传 PRD，解析并调用 DeepSeek 生成报告，成功后自动保存。
+- **新建分析**：上传 PRD，解析并调用所选 LLM 生成报告，成功后自动保存。
 - **报告管理**：按名称搜索、按生成时间排序、查看详情和二次确认删除。
 - **报告详情**：直接读取数据库中的分析结果，不重新调用 AI；按产品概述、
   核心功能、业务规则、潜在风险、需求冲突、需求歧义、需求缺失、待确认问题

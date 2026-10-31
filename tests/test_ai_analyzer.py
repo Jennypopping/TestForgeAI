@@ -3,13 +3,21 @@ import unittest
 from types import SimpleNamespace
 
 import httpx
-from openai import APIConnectionError, BadRequestError, OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    OpenAI,
+)
 
 from services.ai_analyzer import (
     AIAnalysisTrace,
     AIEmptyResponseError,
     AIJSONParseError,
     AIOutputTruncatedError,
+    AIRequestError,
+    AIRequestTimeoutError,
     AIValidationError,
     AIAnalyzer,
     AnalysisItem,
@@ -1219,6 +1227,88 @@ class AIAnalyzerTests(unittest.TestCase):
             analyzer.last_trace.stage_traces[0].attempts,
             2,
         )
+
+    def test_api_timeout_is_reported_after_retries(self):
+        timeout_error = APITimeoutError(
+            request=httpx.Request(
+                'POST',
+                'https://example.test/v1/chat/completions',
+            )
+        )
+        analyzer, completions = _build_analyzer(
+            [timeout_error],
+            max_retries=0,
+        )
+
+        with self.assertRaises(AIRequestTimeoutError) as context:
+            analyzer.analyze('产品文档')
+
+        self.assertEqual(len(completions.requests), 1)
+        self.assertEqual(context.exception.stage, 'generation_1')
+        self.assertEqual(
+            analyzer.last_trace.stage_traces[0].status,
+            'error',
+        )
+
+    def test_unsupported_json_mode_falls_back_and_analysis_continues(self):
+        outcomes = [
+            _bad_request(
+                "Unsupported parameter: 'response_format' "
+                'is not supported with this model'
+            )
+        ] + _successful_outcomes()
+        analyzer, completions = _build_analyzer(outcomes)
+
+        analysis = analyzer.analyze('产品文档')
+
+        self.assertEqual(analysis.product_summary, '访客管理系统')
+        self.assertEqual(len(completions.requests), 8)
+        self.assertIn('response_format', completions.requests[0])
+        self.assertNotIn('response_format', completions.requests[1])
+
+    def test_unsupported_token_parameter_falls_back_and_analysis_continues(self):
+        outcomes = [
+            _bad_request(
+                'Unrecognized request argument supplied: max_tokens'
+            )
+        ] + _successful_outcomes()
+        analyzer, completions = _build_analyzer(outcomes)
+
+        analysis = analyzer.analyze('产品文档')
+
+        self.assertEqual(analysis.product_summary, '访客管理系统')
+        self.assertEqual(len(completions.requests), 8)
+        self.assertNotIn('max_tokens', completions.requests[1])
+        self.assertIn(
+            'max_completion_tokens',
+            completions.requests[1],
+        )
+
+    def test_auth_error_includes_actionable_hint(self):
+        auth_error = AuthenticationError(
+            'Invalid API key',
+            response=httpx.Response(
+                401,
+                request=httpx.Request(
+                    'POST',
+                    'https://example.test/v1/chat/completions',
+                ),
+            ),
+            body=None,
+        )
+        analyzer, completions = _build_analyzer(
+            [auth_error],
+            max_retries=0,
+        )
+
+        with self.assertRaises(AIRequestError) as context:
+            analyzer.analyze('产品文档')
+
+        message = str(context.exception)
+        self.assertEqual(len(completions.requests), 1)
+        self.assertIn('LLM_API_KEY', message)
+        self.assertIn('认证或权限失败', message)
+        self.assertIn('error_hint', context.exception.details)
 
 
 if __name__ == '__main__':

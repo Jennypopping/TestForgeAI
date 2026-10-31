@@ -28,7 +28,7 @@ STAGE_TITLES = {
     'generation_2': '阶段 2 · 业务规则',
     'generation_3': '阶段 3 · 潜在风险',
     'generation_4': '阶段 4 · 冲突、歧义、缺失与待确认问题',
-    'request': 'DeepSeek API 请求',
+    'request': 'LLM API 请求',
     'response': '模型响应',
     'json_parse': 'JSON 解析',
     'validation': 'Pydantic 校验',

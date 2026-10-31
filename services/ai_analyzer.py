@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 import traceback
@@ -11,8 +10,22 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping, Optional, Type
 
 from dotenv import load_dotenv
-from openai import APIConnectionError, APITimeoutError, APIError, OpenAI
+from openai import APIConnectionError, APITimeoutError, APIError
 from pydantic import BaseModel, Field, ValidationError, model_validator
+
+from services.llm_client import (
+    DEFAULT_TIMEOUT_SECONDS as DEFAULT_LLM_TIMEOUT_SECONDS,
+    LLMClient,
+    build_api_error_hint,
+    get_model_output_limit,
+    has_stage_token_override,
+    read_llm_float_setting,
+    read_llm_int_setting,
+    read_stage_token_budget,
+    redact_secrets,
+    resolve_llm_model,
+    resolve_llm_timeout,
+)
 
 load_dotenv()
 
@@ -20,12 +33,6 @@ logger = logging.getLogger(__name__)
 
 AnalysisEventCallback = Callable[['AnalysisEvent'], None]
 
-MODEL_OUTPUT_TOKEN_LIMITS = {
-    'deepseek-chat': 8192,
-    'deepseek-flash': 384 * 1024,
-    'deepseek-reasoner': 8192,
-}
-DEFAULT_MODEL_OUTPUT_TOKEN_LIMIT = 8192
 DEFAULT_MAX_OUTPUT_TOKENS = 32768
 DEFAULT_MAX_TRUNCATION_RECOVERIES = 2
 DEFAULT_MAX_VALIDATION_RETRIES = 1
@@ -61,7 +68,7 @@ MIN_SPLIT_DOCUMENT_CHARS = 1200
 MIN_TRUNCATION_BUDGET_STEP = 4096
 MIN_OUTPUT_TOKEN_FLOOR = 2048
 MAX_OUTPUT_BUDGET_REDUCTIONS = 3
-DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_TIMEOUT_SECONDS = DEFAULT_LLM_TIMEOUT_SECONDS
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 ANALYSIS_LIST_FIELDS = (
@@ -589,7 +596,7 @@ class AIAnalyzer:
 
     def __init__(
         self,
-        client: Optional[OpenAI] = None,
+        client: Optional[Any] = None,
         model: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
@@ -598,15 +605,18 @@ class AIAnalyzer:
         max_truncation_recoveries: Optional[int] = None,
         max_validation_retries: Optional[int] = None,
     ) -> None:
-        self._client = client
-        self.model = model or os.getenv('DEEPSEEK_MODEL', 'deepseek-flash')
-        self.model_output_limit = self._get_model_output_limit(self.model)
+        if client is None or isinstance(client, LLMClient):
+            self._client = client
+        else:
+            self._client = LLMClient.from_openai_client(client)
+        self.model = resolve_llm_model(model)
+        self.model_output_limit = get_model_output_limit(self.model)
 
         requested_output_tokens = (
             max_output_tokens
             if max_output_tokens is not None
-            else self._read_int_env(
-                'DEEPSEEK_MAX_OUTPUT_TOKENS',
+            else read_llm_int_setting(
+                'max_output_tokens',
                 DEFAULT_MAX_OUTPUT_TOKENS,
                 minimum=1,
             )
@@ -623,20 +633,12 @@ class AIAnalyzer:
             1,
             min(requested_output_tokens, self.model_output_limit),
         )
-        self.timeout_seconds = (
-            timeout_seconds
-            if timeout_seconds is not None
-            else self._read_float_env(
-                'DEEPSEEK_TIMEOUT_SECONDS',
-                DEFAULT_TIMEOUT_SECONDS,
-                minimum=1.0,
-            )
-        )
+        self.timeout_seconds = resolve_llm_timeout(timeout_seconds)
         self.max_retries = (
             max_retries
             if max_retries is not None
-            else self._read_int_env(
-                'DEEPSEEK_MAX_RETRIES',
+            else read_llm_int_setting(
+                'max_retries',
                 DEFAULT_MAX_RETRIES,
                 minimum=0,
             )
@@ -644,8 +646,8 @@ class AIAnalyzer:
         self.retry_backoff_seconds = (
             retry_backoff_seconds
             if retry_backoff_seconds is not None
-            else self._read_float_env(
-                'DEEPSEEK_RETRY_BACKOFF_SECONDS',
+            else read_llm_float_setting(
+                'retry_backoff_seconds',
                 DEFAULT_RETRY_BACKOFF_SECONDS,
                 minimum=0.0,
             )
@@ -653,8 +655,8 @@ class AIAnalyzer:
         self.max_truncation_recoveries = (
             max_truncation_recoveries
             if max_truncation_recoveries is not None
-            else self._read_int_env(
-                'DEEPSEEK_MAX_TRUNCATION_RECOVERIES',
+            else read_llm_int_setting(
+                'max_truncation_recoveries',
                 DEFAULT_MAX_TRUNCATION_RECOVERIES,
                 minimum=0,
             )
@@ -662,8 +664,8 @@ class AIAnalyzer:
         self.max_validation_retries = (
             max_validation_retries
             if max_validation_retries is not None
-            else self._read_int_env(
-                'DEEPSEEK_MAX_VALIDATION_RETRIES',
+            else read_llm_int_setting(
+                'max_validation_retries',
                 DEFAULT_MAX_VALIDATION_RETRIES,
                 minimum=0,
             )
@@ -672,11 +674,10 @@ class AIAnalyzer:
         self.stage_budget_overrides: set[str] = set()
         for spec in STAGE_SPECS:
             default_budget = STAGE_OUTPUT_TOKEN_BUDGETS[spec.key]
-            env_name = f'DEEPSEEK_{spec.key.upper()}_MAX_TOKENS'
-            if os.getenv(env_name) is not None:
+            if has_stage_token_override(spec.key):
                 self.stage_budget_overrides.add(spec.key)
-            requested_stage_budget = self._read_int_env(
-                env_name,
+            requested_stage_budget = read_stage_token_budget(
+                spec.key,
                 default_budget,
                 minimum=1,
             )
@@ -708,93 +709,13 @@ class AIAnalyzer:
             json.dumps(self.stage_output_budgets, sort_keys=True),
         )
 
-    @staticmethod
-    def _get_model_output_limit(model: str) -> int:
-        normalized_model = model.strip().lower()
-        output_limit = MODEL_OUTPUT_TOKEN_LIMITS.get(normalized_model)
-        if output_limit is None:
-            logger.warning(
-                'Unknown model=%s; using conservative output limit=%d',
-                model,
-                DEFAULT_MODEL_OUTPUT_TOKEN_LIMIT,
-            )
-            return DEFAULT_MODEL_OUTPUT_TOKEN_LIMIT
-        return output_limit
-
-    @staticmethod
-    def _read_int_env(
-        name: str,
-        default: int,
-        minimum: int = 0,
-    ) -> int:
-        raw_value = os.getenv(name)
-        if raw_value is None:
-            return default
-        try:
-            value = int(raw_value)
-        except (TypeError, ValueError):
-            logger.warning(
-                'Invalid %s=%r; using %d',
-                name,
-                raw_value,
-                default,
-            )
-            return default
-        if value < minimum:
-            logger.warning(
-                'Invalid %s=%r; using %d',
-                name,
-                raw_value,
-                default,
-            )
-            return default
-        return value
-
-    @staticmethod
-    def _read_float_env(
-        name: str,
-        default: float,
-        minimum: float = 0.0,
-    ) -> float:
-        raw_value = os.getenv(name)
-        if raw_value is None:
-            return default
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError):
-            logger.warning(
-                'Invalid %s=%r; using %.1f',
-                name,
-                raw_value,
-                default,
-            )
-            return default
-        if value < minimum:
-            logger.warning(
-                'Invalid %s=%r; using %.1f',
-                name,
-                raw_value,
-                default,
-            )
-            return default
-        return value
-
-    def _resolve_client(self) -> OpenAI:
+    def _resolve_client(self) -> LLMClient:
         if self._client is not None:
             return self._client
 
-        api_key = os.getenv('DEEPSEEK_API_KEY')
-        if not api_key:
-            raise ValueError('未配置 DEEPSEEK_API_KEY')
-
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=os.getenv(
-                'DEEPSEEK_BASE_URL',
-                'https://api.deepseek.com',
-            ),
-            timeout=self.timeout_seconds,
-            max_retries=0,
+        self._client = LLMClient.from_env(
+            model=self.model,
+            timeout_seconds=self.timeout_seconds,
         )
         return self._client
 
@@ -874,7 +795,8 @@ class AIAnalyzer:
                 ),
             )
             raise AIConfigurationError(
-                'AI 配置不完整，请检查 DEEPSEEK_API_KEY',
+                f'AI 配置不完整：{exc}。请检查 LLM_PROVIDER、'
+                'LLM_API_KEY、LLM_BASE_URL 和 LLM_MODEL',
                 trace=trace,
                 stage='request',
             ) from exc
@@ -1075,7 +997,7 @@ class AIAnalyzer:
     def _run_stage(
         self,
         *,
-        client: OpenAI,
+        client: LLMClient,
         spec: _StageSpec,
         stage_trace: AIStageTrace,
         system_prompt: str,
@@ -1113,7 +1035,7 @@ class AIAnalyzer:
     def _run_stage_subtasks(
         self,
         *,
-        client: OpenAI,
+        client: LLMClient,
         spec: _StageSpec,
         stage_trace: AIStageTrace,
         system_prompt: str,
@@ -1210,7 +1132,7 @@ class AIAnalyzer:
     def _run_subtask_with_recovery(
         self,
         *,
-        client: OpenAI,
+        client: LLMClient,
         spec: _StageSpec,
         stage_trace: AIStageTrace,
         subtask: _Subtask,
@@ -1395,7 +1317,7 @@ class AIAnalyzer:
     def _run_split_subtasks(
         self,
         *,
-        client: OpenAI,
+        client: LLMClient,
         spec: _StageSpec,
         stage_trace: AIStageTrace,
         split_subtasks: list[_Subtask],
@@ -1452,7 +1374,7 @@ class AIAnalyzer:
     def _run_subtask_once(
         self,
         *,
-        client: OpenAI,
+        client: LLMClient,
         spec: _StageSpec,
         stage_trace: AIStageTrace,
         subtask: _Subtask,
@@ -1735,7 +1657,7 @@ class AIAnalyzer:
     def _request_with_retries(
         self,
         *,
-        client: OpenAI,
+        client: LLMClient,
         spec: _StageSpec,
         request_trace: AIRequestTrace,
         system_prompt: str,
@@ -1745,6 +1667,11 @@ class AIAnalyzer:
         on_event: Optional[AnalysisEventCallback],
     ) -> Any:
         total_attempts = self.max_retries + 1
+        provider_name = (
+            client.config.provider
+            if client.config is not None
+            else 'injected'
+        )
         request_started = time.perf_counter()
         request_options = {
             'model': self.model,
@@ -1763,11 +1690,20 @@ class AIAnalyzer:
             'max_tokens': max_tokens,
             'timeout': self.timeout_seconds,
         }
+        capabilities = client.request_capabilities(self.model)
         request_trace.request_thinking_config = {
-            'mode': 'model_default',
+            'mode': (
+                'explicit'
+                if capabilities.reasoning_effort
+                else 'model_default'
+            ),
             'reasoning_enabled': True,
+            'json_mode': capabilities.json_mode,
+            'token_parameter': capabilities.token_parameter,
         }
-        request_trace.request_reasoning_effort = None
+        request_trace.request_reasoning_effort = (
+            capabilities.reasoning_effort
+        )
         request_trace.request_max_tokens = request_options['max_tokens']
 
         logger.info(
@@ -1798,7 +1734,7 @@ class AIAnalyzer:
             attempt += 1
             request_trace.attempts = attempt
             try:
-                response = client.chat.completions.create(**request_options)
+                response = client.create_chat_completion(**request_options)
             except APITimeoutError as exc:
                 failed_attempts += 1
                 if failed_attempts < total_attempts:
@@ -1836,6 +1772,11 @@ class AIAnalyzer:
             except APIError as exc:
                 safe_message = _sanitize_text(str(exc))
                 status_code = getattr(exc, 'status_code', None)
+                error_hint = build_api_error_hint(
+                    exc,
+                    provider=provider_name,
+                    model=self.model,
+                )
                 current_max_tokens = request_options['max_tokens']
                 if (
                     _is_max_tokens_rejection(exc)
@@ -1923,15 +1864,25 @@ class AIAnalyzer:
                     type(exc).__name__,
                     safe_message,
                 )
-                raise AIRequestError(
+                error_message = (
                     f'阶段「{spec.label}」API 请求失败：'
-                    f'{type(exc).__name__}: {safe_message}',
+                    f'{type(exc).__name__}: {safe_message}'
+                    f'（provider={provider_name}, model={self.model}, '
+                    f'status={status_code}）'
+                )
+                if error_hint:
+                    error_message += f'。处理建议：{error_hint}'
+                raise AIRequestError(
+                    error_message,
                     trace=trace,
                     stage=spec.key,
                     details={
                         'exception_type': type(exc).__name__,
                         'status_code': status_code,
                         'attempts': failed_attempts,
+                        'provider': provider_name,
+                        'model': self.model,
+                        'error_hint': error_hint,
                     },
                 ) from exc
             except Exception as exc:
@@ -4014,11 +3965,7 @@ def _safe_len(value: Any) -> Optional[int]:
 
 
 def _sanitize_text(value: str) -> str:
-    text = str(value)
-    api_key = os.getenv('DEEPSEEK_API_KEY')
-    if api_key:
-        text = text.replace(api_key, '***')
-    return re.sub(r'sk-[A-Za-z0-9_-]{8,}', 'sk-***', text)
+    return redact_secrets(str(value))
 
 
 def _inspect_json_error(content: str) -> Optional[str]:
@@ -4049,10 +3996,14 @@ def _is_retryable_api_error(exc: APIError) -> bool:
 
 
 def _is_max_tokens_rejection(exc: APIError) -> bool:
-    if getattr(exc, 'status_code', None) != 400:
+    if getattr(exc, 'status_code', None) not in {400, 422}:
         return False
     message = str(exc).lower()
-    if 'max_tokens' in message or 'max tokens' in message:
+    if (
+        'max_tokens' in message
+        or 'max tokens' in message
+        or 'max_completion_tokens' in message
+    ):
         return True
     return (
         'token' in message
@@ -4067,6 +4018,7 @@ def _extract_max_tokens_limit(exc: APIError) -> Optional[int]:
         r'maximum\D{0,30}(\d{3,6})',
         r'supports?\D{0,40}(\d{3,6})',
         r'max_tokens\D{0,40}(\d{3,6})',
+        r'max_completion_tokens\D{0,40}(\d{3,6})',
     )
     for pattern in patterns:
         match = re.search(pattern, message, re.IGNORECASE)
