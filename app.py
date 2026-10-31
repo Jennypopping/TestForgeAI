@@ -7,6 +7,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from services.database import DatabaseInitializationError, initialize_database
+from services.ui_components import inject_button_styles
 
 
 load_dotenv()
@@ -24,6 +25,7 @@ st.set_page_config(
     page_title='TestForge AI',
     layout='wide',
 )
+inject_button_styles()
 
 try:
     initialize_database()
