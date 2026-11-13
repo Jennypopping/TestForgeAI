@@ -24,3 +24,8 @@ data/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Only track Markdown files under src, including nested directories
+/src/**
+!/src/**/
+!/src/**/*.md
